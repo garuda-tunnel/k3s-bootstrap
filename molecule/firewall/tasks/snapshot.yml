@@ -1,0 +1,17 @@
+---
+# Record the managed table and its on-disk inputs in the fact named by
+# k3sb_snapshot_name. Runs on the instance from a localhost play; input:
+# k3sb_instance.
+- name: Take the managed firewall snapshot
+  ansible.builtin.shell: |
+    set -eu
+    nft list table inet k3s_bootstrap
+    sha256sum /etc/k3s-bootstrap/firewall.nft /etc/systemd/system/k3s-bootstrap-firewall.service
+  changed_when: false
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  register: k3sb_table_result
+
+- name: Record the managed firewall snapshot
+  ansible.builtin.set_fact:
+    "{{ k3sb_snapshot_name }}": "{{ k3sb_table_result.stdout }}"

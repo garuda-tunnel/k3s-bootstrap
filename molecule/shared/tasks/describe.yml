@@ -1,0 +1,35 @@
+---
+# Compute the module variables of one instance exactly as a caller of the
+# module passes them. Input: k3sb_instance (inventory name). Output fact:
+# k3sb_node_vars. Node and head connections both use the one controller key
+# that prepare.yml authorized on every instance; the instance's own login key
+# is also passed on, as the module's authorized key for ssh_user.
+- name: Read the instance login public key
+  ansible.builtin.slurp:
+    src: "/home/{{ hostvars[k3sb_instance].ansible_user }}/.ssh/authorized_keys"
+  delegate_to: "{{ k3sb_instance }}"
+  register: k3sb_login_key_file
+
+- name: Compute the module variables of the instance
+  vars:
+    k3sb_inst: "{{ hostvars[k3sb_instance] }}"
+    k3sb_head_name: "{{ k3sb_inst.k3s_head | default('') }}"
+    k3sb_keys: >-
+      {{ (k3sb_login_key_file.content | b64decode).splitlines()
+         | map('trim') | reject('equalto', '') | reject('match', '#') | list }}
+    k3sb_head_vars: >-
+      {{ {'host': hostvars[k3sb_head_name].ansible_host,
+          'port': hostvars[k3sb_head_name].ansible_port | default(22) | int,
+          'user': (hostvars[k3sb_head_name].k3s_node | default({})).ssh_user | default(k3sb_defaults.ssh_user)}
+         if k3sb_head_name != '' else none }}
+  ansible.builtin.set_fact:
+    k3sb_node_vars: >-
+      {{ k3sb_defaults
+         | combine(k3sb_inst.k3s_node | default({}), recursive=True)
+         | combine({'host': k3sb_inst.ansible_host,
+                    'port': k3sb_inst.ansible_port | default(22) | int,
+                    'bootstrap_user': k3sb_inst.ansible_user,
+                    'ssh_private_key_file': k3sb_controller_key,
+                    'host_key_check': false,
+                    'authorized_keys': k3sb_keys,
+                    'head': k3sb_head_vars}) }}

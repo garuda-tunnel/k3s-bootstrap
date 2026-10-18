@@ -1,0 +1,52 @@
+---
+# Assert the converged host state: module functionality is present and listed
+# for the next boot, and the caller's and k3s-owned sysctls are effective and
+# persisted.
+- name: Inspect the required kernel module functionality
+  ansible.builtin.stat:
+    path: "/sys/module/{{ item }}"
+    get_checksum: false
+  loop: [br_netfilter, overlay, tcp_bbr]
+  register: k3sb_module_dirs
+
+- name: Read the running kernel release
+  ansible.builtin.setup:
+    gather_subset: [min]
+
+- name: Read the kernel's built-in module list
+  ansible.builtin.slurp:
+    src: "/lib/modules/{{ ansible_facts.kernel }}/modules.builtin"
+  register: k3sb_modules_builtin
+
+- name: Read the persisted module list
+  ansible.builtin.slurp:
+    src: "{{ k3sb_modules_file }}"
+  register: k3sb_modules_content
+
+- name: Read the persisted sysctl file
+  ansible.builtin.slurp:
+    src: "{{ k3sb_sysctl_file }}"
+  register: k3sb_sysctl_content
+
+- name: Read the effective sysctls
+  # Ansible facts carry no sysctls; /proc/sys holds the live values.
+  ansible.builtin.slurp:
+    src: "/proc/sys/{{ item | replace('.', '/') }}"
+  loop: [vm.max_map_count, net.bridge.bridge-nf-call-iptables, net.bridge.bridge-nf-call-ip6tables]
+  register: k3sb_sysctl_live
+
+- name: Assert modules and sysctls
+  ansible.builtin.assert:
+    that:
+      - k3sb_module_dirs.results | map(attribute='stat.isdir', default=false) | list == [true, true, true]
+      - >-
+        (k3sb_builtin_module ~ '.ko')
+        in ((k3sb_modules_builtin.content | b64decode).splitlines() | map('basename') | list)
+      - (k3sb_modules_content.content | b64decode) == "br_netfilter\noverlay\ntcp_bbr\naf_packet\n"
+      - >-
+        k3sb_sysctl_live.results | map(attribute='content') | map('b64decode') | map('trim') | list
+        == ['262144', '1', '1']
+      - >-
+        (k3sb_sysctl_content.content | b64decode).splitlines()
+        | intersect(['vm.max_map_count=262144', 'net.bridge.bridge-nf-call-iptables=1',
+        'net.bridge.bridge-nf-call-ip6tables=1']) | length == 3

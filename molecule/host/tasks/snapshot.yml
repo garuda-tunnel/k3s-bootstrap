@@ -1,0 +1,41 @@
+---
+# Record the host role's persistent files, live sysctl values, boot id and
+# loaded kernel module names in the fact named by k3sb_snapshot_name. Equal
+# snapshots around a refused run prove it changed nothing. Runs on the
+# instance from a localhost play.
+- name: Take the host snapshot
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  block:
+    - name: Hash the host role's persistent files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop: [/etc/modules-load.d/k3s-bootstrap.conf, /etc/sysctl.d/90-k3s-bootstrap.conf]
+      register: k3sb_snapshot_files
+
+    - name: Read the live sysctls, the boot id and the loaded modules
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - /proc/sys/vm/max_map_count
+        - /proc/sys/net/bridge/bridge-nf-call-iptables
+        - /proc/sys/net/bridge/bridge-nf-call-ip6tables
+        - /proc/sys/kernel/random/boot_id
+        - /proc/modules
+      register: k3sb_snapshot_proc
+
+- name: Record the snapshot
+  vars:
+    k3sb_proc: "{{ k3sb_snapshot_proc.results | map(attribute='content') | map('b64decode') | list }}"
+  ansible.builtin.set_fact:
+    "{{ k3sb_snapshot_name }}":
+      files: "{{ k3sb_snapshot_files.results | map(attribute='stat.checksum') | list }}"
+      sysctls: "{{ k3sb_proc[:3] | map('trim') | list }}"
+      boot_id: "{{ k3sb_proc[3] | trim }}"
+      # First field of /proc/modules: the module name (the use counts move).
+      # Only the modules a run of this scenario can load: k3s and kube-proxy
+      # load unrelated ones asynchronously.
+      modules: >-
+        {{ k3sb_proc[4].splitlines() | map('split') | map('first')
+           | select('in', ['br_netfilter', 'overlay', 'tcp_bbr', 'af_packet', 'tcp_bic']) | sort }}

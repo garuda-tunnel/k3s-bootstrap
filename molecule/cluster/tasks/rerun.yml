@@ -1,0 +1,18 @@
+---
+# Re-apply one joined node at -vvv: nothing may change and no token task may
+# run. Appends the output to k3sb_rerun_outputs. Input: k3sb_instance.
+- name: Re-apply the joined node at -vvv
+  ansible.builtin.include_tasks: ../../shared/tasks/apply.yml
+  vars:
+    k3sb_apply_args: [-vvv]
+
+- name: Assert the re-run was a no-op that touched no token
+  ansible.builtin.assert:
+    that:
+      - k3sb_run is not changed
+      - "'Read the server token of the head' not in k3sb_run.stdout"
+      - "'Mint a short-lived bootstrap token on the head' not in k3sb_run.stdout"
+
+- name: Keep the re-run output
+  ansible.builtin.set_fact:
+    k3sb_rerun_outputs: "{{ k3sb_rerun_outputs | default([]) + [k3sb_run.stdout ~ k3sb_run.stderr] }}"

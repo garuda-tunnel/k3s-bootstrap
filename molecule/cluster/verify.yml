@@ -1,0 +1,138 @@
+---
+- name: Verify the cluster topology from the initial node
+  hosts: k3sb-molecule-cluster-init
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Wait for every node to become Ready
+      ansible.builtin.command: k3s kubectl wait --for=condition=Ready node --all --timeout=180s
+      changed_when: false
+
+    - name: Read the nodes
+      ansible.builtin.command: k3s kubectl get nodes -o json
+      changed_when: false
+      register: k3sb_nodes
+      # The API may answer 503 for a while under load.
+      until: k3sb_nodes.rc == 0
+      retries: 6
+      delay: 5
+
+    - name: Assert three Ready nodes, two of them control-plane
+      vars:
+        k3sb_items: "{{ (k3sb_nodes.stdout | from_json)['items'] }}"
+      ansible.builtin.assert:
+        that:
+          - k3sb_items | length == 3
+          - >-
+            k3sb_items | map(attribute='metadata.labels')
+            | select('contains', 'node-role.kubernetes.io/control-plane') | list | length == 2
+          - >-
+            k3sb_items | map(attribute='status.conditions') | map('selectattr', 'type', 'equalto', 'Ready')
+            | map('map', attribute='status') | map('list') | select('equalto', ['True']) | list | length == 3
+
+    - name: List the bootstrap tokens left on the head
+      ansible.builtin.command:
+        argv: [k3s, kubectl, get, secrets, -n, kube-system, --field-selector, type=bootstrap.kubernetes.io/token, -o, json]
+      changed_when: false
+      register: k3sb_bootstrap_tokens
+      # The API may answer 503 for a while under load.
+      until: k3sb_bootstrap_tokens.rc == 0
+      retries: 6
+      delay: 5
+
+    - name: Assert the agent's bootstrap token was deleted after the join
+      ansible.builtin.assert:
+        that: (k3sb_bootstrap_tokens.stdout | from_json)['items'] | length == 0
+
+- name: Verify the joined nodes' token files and config directories
+  hosts: k3sb-molecule-server:k3sb-molecule-agent
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Read the token file and config directory metadata
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: false
+      loop: [/etc/rancher/k3s/join-token, /etc/rancher/k3s, /etc/rancher/k3s/k3s.yaml]
+      register: k3sb_paths
+
+    - name: Try to read the token file as the SSH user
+      ansible.builtin.command:
+        argv: [runuser, -u, vagrant, --, cat, /etc/rancher/k3s/join-token]
+      register: k3sb_token_read
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Assert the token file is root-only and the agent has no kubeconfig
+      vars:
+        k3sb_token: "{{ k3sb_paths.results[0].stat }}"
+        k3sb_dir: "{{ k3sb_paths.results[1].stat }}"
+        k3sb_agent: "{{ inventory_hostname == 'k3sb-molecule-agent' }}"
+      ansible.builtin.assert:
+        that:
+          - k3sb_token.isreg and k3sb_token.mode == '0600' and k3sb_token.pw_name == 'root'
+          - k3sb_token_read.rc != 0
+          - k3sb_dir.mode == ('0700' if k3sb_agent else '0710')
+          - k3sb_paths.results[2].stat.exists != k3sb_agent
+
+- name: Verify the agent stays Ready across a restart with its token deleted
+  hosts: k3sb-molecule-agent
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Restart the agent
+      ansible.builtin.systemd_service:
+        name: k3s-agent
+        state: restarted
+
+    - name: Wait for every node to be Ready again
+      ansible.builtin.command: k3s kubectl wait --for=condition=Ready node --all --timeout=180s
+      delegate_to: k3sb-molecule-cluster-init
+      changed_when: false
+
+- name: Verify joined re-runs touch no token and no output ever carried one
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../shared/vars/module_vars.yml]
+  vars:
+    k3sb_logs: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+  tasks:
+    - name: Re-apply each joined node at -vvv
+      ansible.builtin.include_tasks: tasks/rerun.yml
+      loop: [k3sb-molecule-server, k3sb-molecule-agent]
+      loop_control:
+        loop_var: k3sb_instance
+
+    - name: Read each joined node's token file
+      # The agent's file holds the bootstrap token deleted on the head, which
+      # is still the secret that must never have been printed.
+      ansible.builtin.slurp:
+        src: /etc/rancher/k3s/join-token
+      delegate_to: "{{ item }}"
+      become: true
+      loop: [k3sb-molecule-server, k3sb-molecule-agent]
+      register: k3sb_tokens
+      no_log: true
+
+    - name: Collect every controller output of the scenario
+      ansible.builtin.set_fact:
+        k3sb_outputs: >-
+          {{ k3sb_rerun_outputs
+             + [lookup('ansible.builtin.file', k3sb_logs ~ '/converge-k3sb-molecule-cluster-init.log'),
+                lookup('ansible.builtin.file', k3sb_logs ~ '/converge-k3sb-molecule-server.log'),
+                lookup('ansible.builtin.file', k3sb_logs ~ '/converge-k3sb-molecule-agent.log')] }}
+
+    - name: Count the outputs that contain a token secret
+      # The secret is the part after `::`; only the count leaves these tasks.
+      ansible.builtin.set_fact:
+        k3sb_token_leaks: >-
+          {{ k3sb_token_leaks | default(0) | int
+             + (k3sb_outputs | select('search', (item.content | b64decode | trim).split('::')[-1] | regex_escape) | list | length) }}
+      loop: "{{ k3sb_tokens.results }}"
+      no_log: true
+
+    - name: Assert no output carried a token
+      ansible.builtin.assert:
+        that: k3sb_token_leaks | int == 0

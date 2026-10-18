@@ -1,0 +1,10 @@
+# The controller toolchain the module itself launches (one pin source).
+-r ../ansible/requirements.txt
+pytest==9.1.1
+pytest-testinfra==10.2.2
+ansible-lint==26.10.1
+molecule==26.10.0
+molecule-plugins[vagrant]==26.10.12
+black==26.10.1
+pylint==4.1.3
+vulture==2.16

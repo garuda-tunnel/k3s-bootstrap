@@ -1,0 +1,40 @@
+---
+dependency:
+  name: galaxy
+  enabled: false
+driver:
+  name: vagrant
+  provider: {name: libvirt}
+platforms:
+  - name: k3sb-molecule-host
+    box: cloud-image/ubuntu-26.04
+    box_version: 20260927.0.0
+    memory: 2048
+    cpus: 2
+    config_options: {synced_folder: false, vm.box_check_update: false}
+    provider_options:
+      uri: qemu:///system
+      driver: kvm
+      default_prefix: k3sb-molecule-
+      management_network_name: default
+      management_network_keep: true
+provisioner:
+  name: ansible
+  inventory:
+    host_vars:
+      k3sb-molecule-host:
+        k3s_node:
+          node_type: initial
+          firewall_mode: 'off'
+          # tcp_bbr is not loaded by k3s or the base image, so seeing it
+          # loaded after a reboot can only come from the persisted list.
+          # af_packet is built into the Ubuntu kernel and has no
+          # /sys/module entry, so only the built-in check can accept it.
+          kernel_modules: [br_netfilter, tcp_bbr, af_packet]
+          sysctls: {vm.max_map_count: '262144'}
+  playbooks:
+    prepare: prepare.yml
+    converge: ../shared/converge.yml
+    verify: verify.yml
+scenario:
+  test_sequence: [create, prepare, converge, idempotence, verify, destroy]

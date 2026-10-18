@@ -1,0 +1,131 @@
+---
+- name: Authorize the controller key
+  ansible.builtin.import_playbook: ../shared/prepare.yml
+
+- name: Create the SSH user with a primary group distinct from its name
+  hosts: k3sb-molecule-recovery-adopt
+  gather_facts: false
+  tasks:
+    - name: Create the admins group
+      become: true
+      ansible.builtin.group:
+        name: admins
+
+    - name: Create the ops user in it
+      become: true
+      ansible.builtin.user:
+        name: ops
+        group: admins
+        create_home: true
+
+- name: Install k3s the legacy cloud-init way on the adoption host
+  hosts: k3sb-molecule-recovery-adopt
+  gather_facts: false
+  vars:
+    k3sb_pin: "{{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'MOLECULE_PROJECT_DIRECTORY') ~ '/tests/k3s-version.txt') | trim }}"
+  tasks:
+    - name: Prepare steps that need root
+      become: true
+      block:
+        - name: Download the upstream installer at the module's pin
+          ansible.builtin.get_url:
+            url: "https://raw.githubusercontent.com/k3s-io/k3s/{{ k3sb_pin }}/install.sh"
+            dest: /var/tmp/legacy-install.sh
+            mode: '0700'
+
+        - name: Run the upstream installer
+          # The legacy shape: same pin, embedded etcd (cluster-init), kubeconfig
+          # world-readable, unit enabled and started by the installer itself.
+          ansible.builtin.command: sh /var/tmp/legacy-install.sh
+          changed_when: true
+          environment:
+            INSTALL_K3S_VERSION: "{{ k3sb_pin }}"
+            INSTALL_K3S_EXEC: server --cluster-init
+            K3S_KUBECONFIG_MODE: '0644'
+          async: 300
+          poll: 3
+
+        - name: Assert the legacy kubeconfig is world-readable
+          ansible.builtin.command: stat -c %a /etc/rancher/k3s/k3s.yaml
+          register: k3sb_legacy_mode
+          changed_when: false
+          failed_when: k3sb_legacy_mode.stdout != '644'
+
+        - name: Create the adoption marker in the legacy datastore
+          ansible.builtin.command: k3s kubectl create configmap adoption-marker --from-literal=value=preserved
+          changed_when: true
+
+        - name: Snapshot the legacy installation before the adoption
+          # The CA hash proves the identity, the etcd directory inode proves the
+          # datastore. The binary and uninstaller-script mtimes together
+          # prove the upstream installer never ran again: it skips a binary
+          # whose hash matches but still rewrites k3s-uninstall.sh.
+          ansible.builtin.shell: |
+            set -eu
+            sha256sum /var/lib/rancher/k3s/server/tls/server-ca.crt
+            stat -c '%i' /var/lib/rancher/k3s/server/db/etcd
+            stat -c '%Y' /usr/local/bin/k3s
+            stat -c '%Y' /usr/local/bin/k3s-uninstall.sh
+          args:
+            executable: /bin/bash
+          changed_when: false
+          register: k3sb_legacy_before
+
+        - name: Persist the pre-adoption snapshot for the verify phase
+          ansible.builtin.copy:
+            content: "{{ k3sb_legacy_before.stdout }}"
+            dest: /var/tmp/k3sb-legacy-before
+            owner: root
+            group: root
+            mode: '0600'
+
+- name: Fail the agent's first join after its bootstrap token was minted
+  # An unknown k3s pin makes the installer download fail after the join
+  # tasks minted the token and wrote the token file: the role's `always`
+  # must still delete the token on the head, and the converge must then
+  # retry the join as a first install.
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../shared/vars/module_vars.yml]
+  tasks:
+    - name: Install the initial node
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+      vars:
+        k3sb_instance: k3sb-molecule-recovery-init
+
+    - name: Apply the agent with an unknown k3s pin
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+      vars:
+        k3sb_instance: k3sb-molecule-recovery-agent
+        k3sb_apply_vars: {k3s_version: v1.36.99+k3s1}
+        k3sb_apply_may_fail: true
+
+    - name: Look for the agent's token file
+      ansible.builtin.stat:
+        path: /etc/rancher/k3s/join-token
+        get_checksum: false
+      delegate_to: k3sb-molecule-recovery-agent
+      become: true
+      register: k3sb_failed_join_token
+
+    - name: List the bootstrap tokens left on the head
+      ansible.builtin.command:
+        argv: [k3s, kubectl, get, secrets, -n, kube-system, --field-selector, type=bootstrap.kubernetes.io/token, -o, json]
+      delegate_to: k3sb-molecule-recovery-init
+      become: true
+      changed_when: false
+      register: k3sb_failed_join_tokens
+      # The API may answer 503 for a while under load.
+      until: k3sb_failed_join_tokens.rc == 0
+      retries: 6
+      delay: 5
+
+    - name: Assert the join failed at the download, after the token, which is gone
+      ansible.builtin.assert:
+        that:
+          - k3sb_run.rc != 0
+          - >-
+            k3sb_run.stdout is regex('TASK \\[k3s : Download the k3s installer\\][^\\n]*\\n(?:(?!TASK \\[)[\\s\\S])*?fatal:')
+          - k3sb_failed_join_token.stat.exists
+          - (k3sb_failed_join_tokens.stdout | from_json)['items'] | length == 0

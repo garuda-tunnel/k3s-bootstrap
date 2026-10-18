@@ -1,0 +1,129 @@
+---
+# The readiness predicate, bounded overall by readiness_timeout:
+#   1. the k3s unit (k3s or k3s-agent) is active;
+#   2. the node's own Ready condition is True, read through the node's
+#      kubeconfig (server types: /etc/rancher/k3s/k3s.yaml as ssh_user,
+#      the connection user, which proves the group access end to end;
+#      agent: the kubelet kubeconfig as root, because
+#      /etc/rancher/k3s/k3s.yaml does not exist on agents);
+#   3. that kubeconfig is not readable by others.
+# A transient x509 error (clock skew, a joining server's bootstrap CA
+# window) also matches and fails fast; that is accepted: it is rare and
+# the message names the cause.
+# Authentication and authorization failures are not retried. kubectl
+# exits 1 for every error, so there is no distinct exit code to decide
+# on. The one documented exception to the "no localized text" rule: the
+# check below matches Unauthorized|Forbidden|x509 in kubectl's stderr.
+# These are stable Kubernetes API error reasons and Go TLS error
+# prefixes, not localized tool prose. Any other failure is retried
+# until the deadline. A failure names its predicate and carries the k3s
+# journal tail.
+
+- name: Resolve the readiness inputs
+  ansible.builtin.set_fact:
+    readiness_service_name: "{{ 'k3s-agent' if node_type == 'agent' else 'k3s' }}"
+    # k3s lower-cases the hostname (uname nodename) for the default node name.
+    readiness_node_name: "{{ k3s_config['node-name'] | default(ansible_facts.nodename | lower) }}"
+    readiness_kubeconfig: >-
+      {{ '/var/lib/rancher/k3s/agent/kubelet.kubeconfig' if node_type == 'agent'
+         else '/etc/rancher/k3s/k3s.yaml' }}
+    readiness_started: "{{ now(utc=true).timestamp() | int }}"
+    readiness_deadline: "{{ now(utc=true).timestamp() | int + hostvars['localhost'].inventory_readiness_seconds | int }}"
+
+- name: Wait until the k3s unit is active
+  # Bounded by the wall-clock deadline; the retry count is a backstop. The
+  # explicit checks below turn an unfinished wait into the real failure.
+  community.general.systemd_info:
+    unitname: ["{{ readiness_service_name }}.service"]
+  register: readiness_unit
+  failed_when: >-
+    readiness_unit.units[readiness_service_name ~ '.service'].activestate != 'active'
+  until: readiness_unit is not failed or now(utc=true).timestamp() | int >= readiness_deadline | int
+  retries: "{{ hostvars['localhost'].inventory_readiness_seconds | int // 5 + 1 }}"
+  delay: 5
+  changed_when: false
+  ignore_errors: true  # noqa: ignore-errors
+
+- name: Decide whether the unit came up
+  ansible.builtin.set_fact:
+    readiness_unit_active: "{{ readiness_unit is not failed }}"
+
+- name: Compute the time left for the node poll
+  # The unit poll and the node poll share one deadline.
+  ansible.builtin.set_fact:
+    readiness_left: >-
+      {{ [hostvars['localhost'].inventory_readiness_seconds | int - (now(utc=true).timestamp() | int - readiness_started | int), 0] | max }}
+  when: readiness_unit_active | bool
+
+- name: Wait until the node reports its own Ready condition
+  # Server types: no become, so kubectl runs as ssh_user. Agent: root.
+  become: "{{ node_type == 'agent' }}"
+  ansible.builtin.command:
+    argv:
+      - k3s
+      - kubectl
+      - --kubeconfig
+      - "{{ readiness_kubeconfig }}"
+      - --request-timeout=10s
+      - get
+      - node
+      - "{{ readiness_node_name }}"
+      - -o
+      - jsonpath={.status.conditions[?(@.type=="Ready")].status}
+  register: readiness_node
+  until: >-
+    (readiness_node.rc == 0 and readiness_node.stdout == 'True')
+    or readiness_node.stderr is search('Unauthorized|Forbidden|x509')
+    or now(utc=true).timestamp() | int >= readiness_deadline | int
+  # Each attempt can take the 10 s request timeout plus the 5 s delay.
+  retries: "{{ readiness_left | int // 15 + 1 }}"
+  delay: 5
+  changed_when: false
+  failed_when: false
+  ignore_errors: true  # noqa: ignore-errors
+  when: readiness_unit_active | bool
+
+- name: Inspect the kubeconfig protection
+  ansible.builtin.stat:
+    path: "{{ readiness_kubeconfig }}"
+    get_checksum: false
+  register: readiness_kubeconfig_stat
+  when:
+    - readiness_unit_active | bool
+    - readiness_node.rc == 0
+    - readiness_node.stdout == 'True'
+
+- name: Decide which predicate failed
+  # Empty means every predicate holds.
+  ansible.builtin.set_fact:
+    readiness_failure: >-
+      {{ ('the k3s unit ' ~ readiness_service_name ~ ' is not active')
+         if not readiness_unit_active | bool
+         else ('kubectl got an authentication or authorization error reading node '
+               ~ readiness_node_name ~ ' through ' ~ readiness_kubeconfig
+               ~ ' (not retried): ' ~ (readiness_node.stderr | trim))
+         if readiness_node.stderr | default('') is search('Unauthorized|Forbidden|x509')
+         else ('node ' ~ readiness_node_name ~ ' did not report the Ready condition True through '
+               ~ readiness_kubeconfig ~ ': rc=' ~ readiness_node.rc ~ ' stdout=' ~ (readiness_node.stdout | trim)
+               ~ ' stderr=' ~ (readiness_node.stderr | trim))
+         if readiness_node.rc != 0 or readiness_node.stdout != 'True'
+         else ('the kubeconfig ' ~ readiness_kubeconfig ~ ' is missing or readable by others')
+         if not readiness_kubeconfig_stat.stat.exists or readiness_kubeconfig_stat.stat.roth
+         else '' }}
+
+- name: Collect the k3s journal tail
+  # timeout(1) bounds journalctl itself; the failure message below
+  # stands even when the journal cannot be read.
+  ansible.builtin.command:
+    argv: [timeout, "30", journalctl, -u, "{{ readiness_service_name }}", -n, "30", --no-pager, -o, cat]
+  register: readiness_journal
+  changed_when: false
+  failed_when: false
+  when: readiness_failure | trim != ''
+
+- name: Fail naming the failed predicate
+  ansible.builtin.fail:
+    msg: >-
+      Readiness failed (timeout {{ readiness_timeout }}): {{ readiness_failure | trim }}.
+      Journal tail: {{ readiness_journal.stdout | default('') }}
+  when: readiness_failure | trim != ''

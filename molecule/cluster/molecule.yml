@@ -1,0 +1,44 @@
+---
+dependency: {name: galaxy, enabled: false}
+driver:
+  name: vagrant
+  provider: {name: libvirt}
+  parallel: true
+platforms:
+  - &node
+    name: k3sb-molecule-cluster-init
+    box: cloud-image/ubuntu-26.04
+    box_version: 20260927.0.0
+    memory: 2048
+    cpus: 2
+    config_options: {synced_folder: false, vm.box_check_update: false}
+    provider_options: &libvirt
+      uri: qemu:///system
+      driver: kvm
+      default_prefix: k3sb-molecule-
+      management_network_name: default
+      management_network_keep: true
+  - <<: *node
+    name: k3sb-molecule-server
+  - <<: *node
+    name: k3sb-molecule-agent
+provisioner:
+  name: ansible
+  inventory:
+    host_vars:
+      k3sb-molecule-cluster-init:
+        # A head user other than the joining nodes' ssh_user: delegated head
+        # tasks must connect as head.user.
+        k3s_node: {node_type: initial, ssh_user: ops, firewall_mode: 'off', readiness_timeout: 10m}
+      k3sb-molecule-server:
+        k3s_node: {node_type: server, firewall_mode: 'off', readiness_timeout: 10m}
+        k3s_head: k3sb-molecule-cluster-init
+      k3sb-molecule-agent:
+        k3s_node: {node_type: agent, firewall_mode: 'off', readiness_timeout: 10m}
+        k3s_head: k3sb-molecule-cluster-init
+  playbooks:
+    prepare: ../shared/prepare.yml
+    converge: converge.yml
+    verify: verify.yml
+scenario:
+  test_sequence: [create, prepare, converge, idempotence, verify, destroy]

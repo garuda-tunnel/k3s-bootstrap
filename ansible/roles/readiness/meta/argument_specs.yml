@@ -1,0 +1,21 @@
+---
+# Inputs of the role, checked by Ansible on role entry; see README.md for
+# what the role does. Render: ansible-doc -t role -r ansible/roles readiness
+argument_specs:
+  main:
+    short_description: Wait until the node is Ready and its kubeconfig is protected
+    description: See README.md in this role.
+    options:
+      node_type:
+        description: What this node becomes; initial bootstraps the cluster (embedded etcd), server and agent join through head.
+        type: str
+        required: true
+        choices: [initial, server, agent]
+      k3s_config:
+        description: Extra keys for /etc/rancher/k3s/config.yaml. Module-owned keys win; cluster-reset keys are refused. Never secrets.
+        type: dict
+        required: true
+      readiness_timeout:
+        description: Bound for the k3s service start and for the readiness checks, as <n>s, <n>m or <n>h.
+        type: str
+        required: true

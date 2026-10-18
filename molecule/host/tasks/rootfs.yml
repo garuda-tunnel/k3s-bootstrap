@@ -1,0 +1,130 @@
+---
+# Grow the VM's disk online (as a cloud disk resize would), prove the
+# filesystem did not follow by itself, let the module grow the root
+# partition and filesystem into it, and prove file data survived. Runs in a
+# localhost play (the module is launched from there): the tasks that touch the
+# instance sit in blocks delegated to it as root. Input: k3sb_instance.
+- name: Find the root disk and write data that must survive the growth
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  block:
+    - name: Read the device and mount facts
+      ansible.builtin.setup:
+        gather_subset: [hardware]
+      delegate_facts: true
+
+    - name: Write a marker file
+      ansible.builtin.copy:
+        content: marker
+        dest: /var/tmp/k3sb-rootfs-marker
+        mode: '0644'
+
+    - name: Write a random blob
+      ansible.builtin.command:
+        argv: [dd, if=/dev/urandom, of=/var/tmp/k3sb-rootfs-blob, bs=1M, count=16]
+      changed_when: true
+
+- name: Name the root partition and its disk
+  vars:
+    k3sb_facts: "{{ hostvars[k3sb_instance].ansible_facts }}"
+    k3sb_root_device: "{{ (k3sb_facts.mounts | selectattr('mount', 'equalto', '/') | first).device | basename }}"
+  ansible.builtin.set_fact:
+    k3sb_root_part: "{{ k3sb_root_device }}"
+    k3sb_root_disk: >-
+      {{ k3sb_facts.devices | dict2items | selectattr('value.partitions', 'contains', k3sb_root_device)
+         | map(attribute='key') | first }}
+
+- name: Read the sizes before the disk grows
+  ansible.builtin.include_tasks: rootfs_read.yml
+  vars:
+    k3sb_rootfs_name: k3sb_root_before
+
+- name: Find the libvirt domain of this VM
+  ansible.builtin.command: virsh -c qemu:///system list --name
+  changed_when: false
+  register: k3sb_domains
+
+- name: Pick the domain
+  ansible.builtin.set_fact:
+    k3sb_domain: "{{ k3sb_domains.stdout_lines | select('search', k3sb_instance ~ '$') | list }}"
+
+- name: Assert exactly one domain matched
+  ansible.builtin.assert:
+    that: k3sb_domain | length == 1
+
+- name: Resize the VM disk online by 8 GiB
+  ansible.builtin.command: >-
+    virsh -c qemu:///system blockresize {{ k3sb_domain[0] }}
+    {{ k3sb_root_disk }} {{ k3sb_root_before.disk | int + 8589934592 }}b
+  changed_when: true
+
+- name: Wait for the guest to see the bigger disk
+  ansible.builtin.slurp:
+    src: "/sys/class/block/{{ k3sb_root_disk }}/size"
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  register: k3sb_disk_grown
+  until: (k3sb_disk_grown.content | b64decode | int) * 512 == k3sb_root_before.disk | int + 8589934592
+  retries: 20
+  delay: 3
+
+- name: Read the sizes before the module runs
+  ansible.builtin.include_tasks: rootfs_read.yml
+  vars:
+    k3sb_rootfs_name: k3sb_root_idle
+
+- name: Assert the filesystem did not grow by itself
+  ansible.builtin.assert:
+    that: k3sb_root_idle.fs | int == k3sb_root_before.fs | int
+
+- name: Apply with root growth requested
+  ansible.builtin.include_tasks: ../../shared/tasks/apply.yml
+  vars:
+    k3sb_apply_vars: {grow_root_filesystem: true}
+
+- name: Read the grown partition, filesystem and data
+  ansible.builtin.include_tasks: rootfs_read.yml
+  vars:
+    k3sb_rootfs_name: k3sb_root_after
+
+- name: Assert the partition and filesystem grew into the new space with the data intact
+  ansible.builtin.assert:
+    that:
+      - k3sb_run is changed
+      - >-
+        k3sb_run.stdout is regex('TASK \\[host : Grow the root partition\\][^\\n]*\\n(?:(?!TASK \\[)[\\s\\S])*?changed:')
+      - >-
+        k3sb_run.stdout is regex('TASK \\[host : Report whether the root filesystem grew\\][^\\n]*\\n(?:(?!TASK \\[)[\\s\\S])*?changed:')
+      - k3sb_root_after.part | int > k3sb_root_before.part | int + 7000000000
+      - k3sb_root_after.fs | int > k3sb_root_before.fs | int + 7000000000
+      - k3sb_root_after.data == k3sb_root_before.data
+
+- name: Re-apply with root growth requested on an already grown disk
+  # The partition already fills the disk: no growpart, no failure.
+  ansible.builtin.include_tasks: ../../shared/tasks/apply.yml
+  vars:
+    k3sb_apply_vars: {grow_root_filesystem: true}
+
+- name: Read the filesystem and data after the repeated apply
+  ansible.builtin.include_tasks: rootfs_read.yml
+  vars:
+    k3sb_rootfs_name: k3sb_root_again
+
+- name: Assert the repeated apply reports no change and keeps the size and data
+  ansible.builtin.assert:
+    that:
+      - k3sb_run is not changed
+      - >-
+        k3sb_run.stdout is regex('TASK \\[host : Grow the root partition\\][^\\n]*\\n(?:(?!TASK \\[)[\\s\\S])*?skipping:')
+      - >-
+        k3sb_run.stdout is regex('TASK \\[host : Report whether the root filesystem grew\\][^\\n]*\\n(?:(?!TASK \\[)[\\s\\S])*?ok:')
+      - k3sb_root_again.fs | int == k3sb_root_after.fs | int
+      - k3sb_root_again.data == k3sb_root_before.data
+
+- name: Remove the data files
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  ansible.builtin.file:
+    path: "/var/tmp/{{ item }}"
+    state: absent
+  loop: [k3sb-rootfs-marker, k3sb-rootfs-blob]

@@ -1,0 +1,68 @@
+---
+# Managed mode on a server (initial or server): one isolated nftables table
+# gates the k3s API (6443) and the embedded etcd client and peer ports
+# (2379-2380, which etcd binds on the node address too) to loopback,
+# api_trusted_cidrs and cluster_cidrs. Agents serve neither, and off mode
+# touches nothing (preflight refuses off mode over an existing module
+# firewall).
+- name: Manage the isolated firewall
+  when:
+    - firewall_mode == 'managed'
+    - node_type != 'agent'
+  block:
+    - name: Install nftables for managed server firewalls
+      ansible.builtin.apt:
+        name: nftables
+        state: present
+        update_cache: true
+
+    - name: Create the firewall configuration directory
+      ansible.builtin.file:
+        path: "{{ k3s_firewall_ruleset | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install the isolated nftables ruleset
+      ansible.builtin.template:
+        src: firewall.nft.j2
+        dest: "{{ k3s_firewall_ruleset }}"
+        owner: root
+        group: root
+        mode: '0600'
+        validate: nft -c -f %s
+      register: firewall_ruleset
+
+    - name: Install the isolated firewall unit
+      ansible.builtin.template:
+        src: k3s-bootstrap-firewall.service.j2
+        dest: "{{ k3s_firewall_unit }}"
+        owner: root
+        group: root
+        mode: '0644'
+      register: firewall_unit_file
+
+    - name: Enable and start the isolated firewall unit
+      # A first start loads the ruleset itself; an already running unit is
+      # left alone here and reloaded below only when something changed.
+      ansible.builtin.systemd_service:
+        name: "{{ k3s_firewall_unit | basename }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      register: firewall_unit_start
+
+    - name: Reload the isolated firewall unit when the ruleset or unit changed
+      # "reloaded" runs ExecReload (a single atomic `nft -f` transaction).
+      # Never "restarted": that would run ExecStop (destroy table) and
+      # ExecStart (load table) as two separate steps, leaving the API
+      # unprotected between them, and losing the table entirely if the load
+      # then fails. Skipped when nothing changed so an unchanged apply
+      # reports no change, and after a first start that just loaded the rules.
+      ansible.builtin.systemd_service:
+        name: "{{ k3s_firewall_unit | basename }}"
+        state: reloaded
+      when:
+        - firewall_ruleset is changed or firewall_unit_file is changed
+        - firewall_unit_start is not changed

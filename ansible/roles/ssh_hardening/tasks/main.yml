@@ -1,0 +1,57 @@
+---
+- name: Check for an existing SSH hardening drop-in
+  ansible.builtin.stat:
+    path: /etc/ssh/sshd_config.d/00-k3s-bootstrap.conf
+  register: ssh_hardening_previous_file
+
+- name: Read the existing SSH hardening drop-in
+  ansible.builtin.slurp:
+    src: /etc/ssh/sshd_config.d/00-k3s-bootstrap.conf
+  register: ssh_hardening_previous_content
+  when: ssh_hardening_previous_file.stat.exists
+
+- name: Install a validated SSH hardening drop-in
+  block:
+    - name: Write the SSH hardening drop-in
+      ansible.builtin.template:
+        src: sshd_config.conf.j2
+        dest: /etc/ssh/sshd_config.d/00-k3s-bootstrap.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload ssh
+
+    - name: Validate the complete SSH configuration
+      ansible.builtin.command: sshd -t
+      changed_when: false
+
+    - name: Reload SSH before later roles can fail
+      ansible.builtin.meta: flush_handlers
+  rescue:
+    - name: Restore the previous SSH hardening drop-in
+      ansible.builtin.copy:
+        content: "{{ ssh_hardening_previous_content.content | b64decode }}"
+        dest: /etc/ssh/sshd_config.d/00-k3s-bootstrap.conf
+        owner: root
+        group: root
+        mode: '0644'
+      when: ssh_hardening_previous_file.stat.exists
+
+    - name: Remove an invalid new SSH hardening drop-in
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d/00-k3s-bootstrap.conf
+        state: absent
+      when: not ssh_hardening_previous_file.stat.exists
+
+    - name: Validate the restored SSH configuration
+      ansible.builtin.command: sshd -t
+      changed_when: false
+
+    - name: Reload the restored SSH configuration
+      ansible.builtin.service:
+        name: ssh
+        state: reloaded
+
+    - name: Stop after SSH configuration validation failed
+      ansible.builtin.fail:
+        msg: SSH configuration validation failed; the previous configuration was restored.

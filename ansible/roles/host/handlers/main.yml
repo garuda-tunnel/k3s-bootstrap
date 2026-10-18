@@ -1,0 +1,9 @@
+---
+# Notified by the `host` role only on a first install (see tasks/main.yml) and
+# flushed at the end of the host play, so the reboot precedes the k3s install.
+- name: Reboot the host
+  listen: reboot required
+  ansible.builtin.reboot:
+    # The seconds value is computed once by the inventory play from
+    # connection_timeout and bounds the whole shutdown, boot and reconnect.
+    reboot_timeout: "{{ hostvars['localhost'].inventory_connection_seconds | int }}"

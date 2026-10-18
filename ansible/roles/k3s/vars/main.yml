@@ -1,0 +1,7 @@
+---
+# Token file named by config.yaml on joining nodes (0600 root, CON-009). A
+# constant, not an input: the k3s_config denylist keeps token-file module-owned.
+k3s_token_file: /etc/rancher/k3s/join-token
+# The upstream unit names; preflight refuses a node whose unit disagrees.
+k3s_service_name: "{{ 'k3s-agent' if node_type == 'agent' else 'k3s' }}"
+k3s_unit: "{{ k3s_service_name }}.service"

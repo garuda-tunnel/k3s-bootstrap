@@ -1,0 +1,49 @@
+---
+# Inputs of the role, checked by Ansible on role entry; see README.md for
+# what the role does. Render: ansible-doc -t role -r ansible/roles k3s
+argument_specs:
+  main:
+    short_description: Install k3s for one node type and join it through the head
+    description: See README.md in this role.
+    options:
+      node_type:
+        description: What this node becomes; initial bootstraps the cluster (embedded etcd), server and agent join through head.
+        type: str
+        required: true
+        choices: [initial, server, agent]
+      head:
+        description: SSH coordinates of a node that already runs the cluster as a server. Required for server and agent, null for initial.
+        type: dict
+        options:
+          host:
+            description: Address of the head; the join address is host:6443.
+            type: str
+            required: true
+          port:
+            description: SSH port of the head.
+            type: int
+            default: 22
+          user:
+            description: Admin user on the head with passwordless sudo.
+            type: str
+            required: true
+      host:
+        description: Hostname or IP address of the node.
+        type: str
+        required: true
+      ssh_user:
+        description: Non-root admin user the module provisions and later connects as; never root.
+        type: str
+        required: true
+      k3s_version:
+        description: Exact k3s pin, for example v1.36.5+k3s1.
+        type: str
+        required: true
+      k3s_config:
+        description: Extra keys for /etc/rancher/k3s/config.yaml. Module-owned keys win; cluster-reset keys are refused. Never secrets.
+        type: dict
+        required: true
+      readiness_timeout:
+        description: Bound for the k3s service start and for the readiness checks, as <n>s, <n>m or <n>h.
+        type: str
+        required: true

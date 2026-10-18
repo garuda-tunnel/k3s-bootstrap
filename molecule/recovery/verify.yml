@@ -1,0 +1,86 @@
+---
+- name: Verify the retried agent joined and no bootstrap token is left
+  hosts: k3sb-molecule-recovery-init
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Wait for both nodes to become Ready
+      ansible.builtin.command: k3s kubectl wait --for=condition=Ready node --all --timeout=180s
+      changed_when: false
+
+    - name: Read the nodes and the bootstrap tokens
+      ansible.builtin.command:
+        argv: "{{ item }}"
+      loop:
+        - [k3s, kubectl, get, nodes, -o, json]
+        - [k3s, kubectl, get, secrets, -n, kube-system, --field-selector, type=bootstrap.kubernetes.io/token, -o, json]
+      changed_when: false
+      register: k3sb_state
+      # The API may answer 503 for a while under load.
+      until: k3sb_state.rc == 0
+      retries: 6
+      delay: 5
+
+    - name: Assert two nodes and no bootstrap token
+      ansible.builtin.assert:
+        that:
+          - (k3sb_state.results[0].stdout | from_json)['items'] | length == 2
+          - (k3sb_state.results[1].stdout | from_json)['items'] | length == 0
+
+- name: Verify the module adopted the legacy installation without re-running the installer
+  hosts: k3sb-molecule-recovery-adopt
+  gather_facts: false
+  tasks:
+    - name: Verify contracts on root-owned system state
+      become: true
+      block:
+        - name: Read the pre-adoption snapshot from the prepare phase
+          ansible.builtin.slurp:
+            src: /var/tmp/k3sb-legacy-before
+          register: k3sb_legacy_before_file
+
+        - name: Assert the kubeconfig carries the login user's real primary group
+          ansible.builtin.shell: |
+            set -eu
+            test "$(id -gn ops)" = admins
+            test "$(stat -c '%a %U %G' /etc/rancher/k3s/k3s.yaml)" = '640 root admins'
+          args:
+            executable: /bin/bash
+          changed_when: false
+
+        - name: Assert the adoption marker survived in the datastore
+          ansible.builtin.command:
+            argv:
+              - k3s
+              - kubectl
+              - get
+              - configmap
+              - adoption-marker
+              - -o
+              - jsonpath={.data.value}
+          register: k3sb_marker
+          changed_when: false
+          failed_when: k3sb_marker.stdout != 'preserved'
+
+        - name: Snapshot the adopted installation
+          ansible.builtin.shell: |
+            set -eu
+            sha256sum /var/lib/rancher/k3s/server/tls/server-ca.crt
+            stat -c '%i' /var/lib/rancher/k3s/server/db/etcd
+            stat -c '%Y' /usr/local/bin/k3s
+            stat -c '%Y' /usr/local/bin/k3s-uninstall.sh
+          args:
+            executable: /bin/bash
+          changed_when: false
+          register: k3sb_legacy_after
+
+        - name: Assert identity, datastore and installer witnesses survived the adoption
+          # Lines: CA hash, etcd directory inode, binary mtime, uninstaller-script
+          # mtime. Identical output means no datastore or identity reset and
+          # that the upstream installer never ran again: it skips a binary
+          # whose hash matches but still rewrites k3s-uninstall.sh.
+          ansible.builtin.assert:
+            that: k3sb_legacy_after.stdout | trim == k3sb_legacy_before_file.content | b64decode | trim
+            fail_msg: >-
+              The adoption changed the CA, datastore inode, binary mtime or
+              uninstaller-script mtime: {{ k3sb_legacy_after.stdout }}

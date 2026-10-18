@@ -1,0 +1,17 @@
+---
+# Converge the nodes in the order a caller composes them: the initial node
+# first, then the server and the agent through it as their head (see ../shared/tasks/apply.yml).
+# Every launch runs at -vvv and the first converge of each node is kept in the
+# ephemeral directory, so verify.yml can search a real join's controller output
+# for the token.
+- name: Apply the module playbook to every node in order
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../shared/vars/module_vars.yml]
+  tasks:
+    - name: Apply the module playbook and keep the first converge output
+      ansible.builtin.include_tasks: tasks/apply_logged.yml
+      loop: [k3sb-molecule-cluster-init, k3sb-molecule-server, k3sb-molecule-agent]
+      loop_control:
+        loop_var: k3sb_instance

@@ -1,0 +1,29 @@
+---
+# Open a brand-new SSH connection from the controller (never a reused
+# Ansible connection), so a firewall change that blocks new connections
+# fails it. Runs in a localhost play; input: k3sb_instance.
+- name: Open a fresh SSH connection from the controller
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -o
+      - ControlMaster=no
+      - -o
+      - ControlPath=none
+      - -o
+      - BatchMode=yes
+      - -o
+      - ConnectTimeout=10
+      - -o
+      - IdentitiesOnly=yes
+      - -o
+      - StrictHostKeyChecking=no
+      - -o
+      - UserKnownHostsFile=/dev/null
+      - -i
+      - "{{ hostvars[k3sb_instance].ansible_private_key_file }}"
+      - -p
+      - "{{ hostvars[k3sb_instance].ansible_port }}"
+      - "{{ hostvars[k3sb_instance].ansible_user }}@{{ hostvars[k3sb_instance].ansible_host }}"
+      - 'true'
+  changed_when: false

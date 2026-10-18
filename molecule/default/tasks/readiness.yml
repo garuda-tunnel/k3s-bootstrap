@@ -1,0 +1,121 @@
+---
+# Readiness negatives on the converged node, each restored afterwards:
+# a kubeconfig readable by others, a stopped unit (bounded by a 30 s
+# readiness_timeout) and a kubeconfig trusting a foreign CA (x509, not
+# retried: fails well inside the 5 m default). Durations are compared with a
+# passing readiness run, so playbook overhead does not count. Input:
+# k3sb_instance.
+- name: Time a passing readiness run
+  ansible.builtin.include_tasks: readiness_run.yml
+
+- name: Keep the passing baseline
+  ansible.builtin.set_fact:
+    k3sb_readiness_baseline: "{{ k3sb_readiness_seconds | int }}"
+
+- name: Refuse a kubeconfig readable by others
+  block:
+    - name: Make the kubeconfig world-readable
+      ansible.builtin.file:
+        path: /etc/rancher/k3s/k3s.yaml
+        mode: '0644'
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+
+    - name: Run readiness over the world-readable kubeconfig
+      ansible.builtin.include_tasks: readiness_run.yml
+      vars:
+        k3sb_apply_may_fail: true
+
+    - name: Keep the world-readable run
+      ansible.builtin.set_fact:
+        k3sb_readiness_world: "{{ k3sb_run }}"
+  always:
+    - name: Restore the kubeconfig mode
+      ansible.builtin.file:
+        path: /etc/rancher/k3s/k3s.yaml
+        mode: '0640'
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+
+- name: Fail a stopped unit within the readiness timeout
+  block:
+    - name: Stop k3s
+      ansible.builtin.systemd_service:
+        name: k3s
+        state: stopped
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+
+    - name: Run readiness against the stopped unit with a 30 s timeout
+      ansible.builtin.include_tasks: readiness_run.yml
+      vars:
+        k3sb_apply_vars: {readiness_timeout: 30s}
+        k3sb_apply_may_fail: true
+
+    - name: Keep the stopped-unit run
+      ansible.builtin.set_fact:
+        k3sb_readiness_stopped: "{{ k3sb_run }}"
+        k3sb_readiness_stopped_seconds: "{{ k3sb_readiness_seconds | int }}"
+  always:
+    - name: Start k3s again
+      ansible.builtin.systemd_service:
+        name: k3s
+        state: started
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+
+- name: Fail fast on a kubeconfig that trusts a foreign CA
+  block:
+    - name: Point the kubeconfig at a foreign CA
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cp -p /etc/rancher/k3s/k3s.yaml /var/tmp/k3sb-k3s.yaml
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
+          -subj /CN=k3sb-foreign -keyout /dev/null -out /var/tmp/k3sb-foreign.crt 2>/dev/null
+        foreign=$(base64 -w0 /var/tmp/k3sb-foreign.crt)
+        sed -i "s|certificate-authority-data: .*|certificate-authority-data: ${foreign}|" /etc/rancher/k3s/k3s.yaml
+      args:
+        executable: /bin/bash
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      changed_when: true
+
+    - name: Run readiness over the foreign CA
+      ansible.builtin.include_tasks: readiness_run.yml
+      vars:
+        k3sb_apply_may_fail: true
+
+    - name: Keep the foreign-CA run
+      ansible.builtin.set_fact:
+        k3sb_readiness_foreign: "{{ k3sb_run }}"
+        k3sb_readiness_foreign_seconds: "{{ k3sb_readiness_seconds | int }}"
+  always:
+    - name: Restore the kubeconfig
+      ansible.builtin.command: mv /var/tmp/k3sb-k3s.yaml /etc/rancher/k3s/k3s.yaml
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      changed_when: true
+
+- name: Show the readiness durations
+  ansible.builtin.debug:
+    msg: >-
+      passing={{ k3sb_readiness_baseline }}s stopped={{ k3sb_readiness_stopped_seconds }}s
+      foreign={{ k3sb_readiness_foreign_seconds }}s
+
+- name: Assert each negative failed in the readiness play within its bound
+  # Bounds over the passing baseline: the stopped unit waits its 30 s
+  # timeout plus up to one 5 s poll and the journal read (15 s margin); the
+  # foreign CA fails on the first attempt (one 10 s request timeout plus
+  # the journal read, well under the 300 s default).
+  ansible.builtin.assert:
+    that:
+      - item.rc != 0
+      - >-
+        item.stdout is regex('TASK \[readiness : Fail naming the failed predicate\][^\n]*\n(?:(?!TASK \[)[\s\S])*?fatal:')
+  loop: ["{{ k3sb_readiness_world }}", "{{ k3sb_readiness_stopped }}", "{{ k3sb_readiness_foreign }}"]
+
+- name: Assert the time bounds
+  ansible.builtin.assert:
+    that:
+      - k3sb_readiness_stopped_seconds | int - k3sb_readiness_baseline | int < 30 + 15
+      - k3sb_readiness_foreign_seconds | int - k3sb_readiness_baseline | int < 30

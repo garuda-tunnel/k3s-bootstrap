@@ -1,0 +1,35 @@
+---
+dependency:
+  name: galaxy
+  enabled: false
+driver:
+  name: vagrant
+  provider: {name: libvirt}
+platforms:
+  - name: k3sb-molecule-firewall
+    box: cloud-image/ubuntu-26.04
+    box_version: 20260927.0.0
+    memory: 2048
+    cpus: 2
+    config_options: {synced_folder: false, vm.box_check_update: false}
+    provider_options:
+      uri: qemu:///system
+      driver: kvm
+      default_prefix: k3sb-molecule-
+      management_network_name: default
+      management_network_keep: true
+provisioner:
+  name: ansible
+  inventory:
+    host_vars:
+      k3sb-molecule-firewall:
+        k3s_node:
+          node_type: initial
+          firewall_mode: managed
+          api_trusted_cidrs: [192.168.122.1/32]
+  playbooks:
+    prepare: ../shared/prepare.yml
+    converge: ../shared/converge.yml
+    verify: verify.yml
+scenario:
+  test_sequence: [create, prepare, converge, idempotence, verify, destroy]

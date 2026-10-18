@@ -1,0 +1,537 @@
+---
+# Inputs are checked on role entry (meta/argument_specs.yml) and by the inventory role.
+- name: Check whether the isolated firewall unit file exists
+  ansible.builtin.stat:
+    path: "{{ k3s_firewall_unit }}"
+    get_checksum: false
+  register: preflight_firewall_unit
+  when: firewall_mode == 'off'
+
+- name: Check whether the isolated firewall ruleset file exists
+  ansible.builtin.stat:
+    path: "{{ k3s_firewall_ruleset }}"
+    get_checksum: false
+  register: preflight_firewall_ruleset
+  when: firewall_mode == 'off'
+
+- name: Check whether nft is available for off-mode firewall detection
+  ansible.builtin.stat:
+    path: /usr/sbin/nft
+  register: preflight_nft_binary
+  when: firewall_mode == 'off'
+
+- name: Require nft to inspect an existing module firewall
+  # Without nft the table check below would silently see no tables.
+  ansible.builtin.assert:
+    that: >-
+      preflight_nft_binary.stat.exists
+      or not (preflight_firewall_unit.stat.exists or preflight_firewall_ruleset.stat.exists)
+    fail_msg: >-
+      firewall_mode=off found a module firewall unit or ruleset file but nft is
+      not available to inspect it; install nftables or remove
+      {{ k3s_firewall_unit }} and {{ k3s_firewall_ruleset }} before retrying.
+  when: firewall_mode == 'off'
+
+- name: List nftables tables for off-mode firewall detection
+  ansible.builtin.command: nft --json list tables
+  changed_when: false
+  register: preflight_nft_tables
+  when:
+    - firewall_mode == 'off'
+    - preflight_nft_binary.stat.exists
+
+- name: Detect the isolated nftables table
+  ansible.builtin.set_fact:
+    preflight_firewall_table_exists: >-
+      {{ (preflight_nft_tables.stdout | default('{"nftables": []}') | from_json).nftables
+         | selectattr('table', 'defined') | map(attribute='table')
+         | selectattr('family', 'equalto', 'inet')
+         | selectattr('name', 'equalto', 'k3s_bootstrap') | list | length > 0 }}
+  when: firewall_mode == 'off'
+
+- name: Refuse off mode with a module firewall
+  ansible.builtin.assert:
+    that:
+      - not preflight_firewall_unit.stat.exists
+      - not preflight_firewall_table_exists
+    fail_msg: >-
+      firewall_mode=off refuses an existing module firewall; run systemctl disable --now
+      k3s-bootstrap-firewall; nft destroy table inet k3s_bootstrap; rm
+      {{ k3s_firewall_unit }} {{ k3s_firewall_ruleset }};
+      systemctl daemon-reload before retrying.
+  when: firewall_mode == 'off'
+
+- name: Verify the supported host
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == 'Ubuntu'
+      - ansible_distribution_version == '26.04'
+      - ansible_service_mgr == 'systemd'
+    fail_msg: >-
+      Bootstrap requires Ubuntu 26.04 with systemd.
+
+- name: Reject caller sysctls that conflict with k3s
+  ansible.builtin.assert:
+    that: item.value == k3s_owned_sysctls.default[item.key | replace('/', '.')]
+    fail_msg: >-
+      sysctls.{{ item.key }}={{ item.value }} conflicts with k3s, which owns
+      this key with value {{ k3s_owned_sysctls.default[item.key | replace('/', '.')] }}.
+  loop: "{{ sysctls | dict2items }}"
+  # sysctl keys use '.' or '/' interchangeably; normalise before comparing
+  # so a slash-form key cannot bypass the ownership check.
+  when: (item.key | replace('/', '.')) in k3s_owned_sysctls.default
+
+- name: Find candidate sysctl conf files
+  ansible.builtin.find:
+    paths:
+      - /etc/sysctl.d
+      - /run/sysctl.d
+      - /usr/local/lib/sysctl.d
+      - /usr/lib/sysctl.d
+      - /lib/sysctl.d
+    file_type: any
+    follow: true
+    patterns: '*.conf'
+    # Ours shadows every same-named file of a lower-priority directory, so a
+    # name match is never applied by systemd-sysctl.
+    excludes: "{{ k3s_sysctl_file | basename }}"
+  register: preflight_sysctl_candidates
+
+- name: Check for a legacy /etc/sysctl.conf
+  ansible.builtin.stat:
+    path: /etc/sysctl.conf
+  register: preflight_sysctl_conf_present
+
+- name: Build the candidate sysctl path list
+  ansible.builtin.set_fact:
+    preflight_sysctl_candidate_paths: >-
+      {{ (preflight_sysctl_candidates.files | map(attribute='path') | list)
+         + (['/etc/sysctl.conf'] if preflight_sysctl_conf_present.stat.exists else []) }}
+
+- name: Resolve each candidate, following symlinks
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+  loop: "{{ preflight_sysctl_candidate_paths }}"
+  register: preflight_sysctl_resolved
+
+- name: Build the foreign sysctl file list
+  ansible.builtin.set_fact:
+    # systemd-sysctl only reads *.conf regular files. A symlink that
+    # resolves to anything else (most commonly /dev/null) is a deliberate
+    # mask, not a conflict. Filtering to isreg here also keeps slurp below
+    # from ever touching a FIFO (it would block) or a symlink to a
+    # directory (it would fail).
+    preflight_foreign_sysctl_paths: >-
+      {{ preflight_sysctl_resolved.results
+         | selectattr('stat.exists')
+         | selectattr('stat.isreg')
+         | map(attribute='item')
+         | list }}
+
+- name: Read foreign sysctl override files
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop: "{{ preflight_foreign_sysctl_paths }}"
+  register: preflight_foreign_sysctl_contents
+
+- name: Reject foreign k3s sysctl overrides
+  ansible.builtin.assert:
+    that: >-
+      (item.0.content | b64decode) is not regex(
+        '(?m)^\\s*'
+        ~ (item.1.key.split('.') | map('regex_escape') | list | join('[./]'))
+        ~ '\\s*=\\s*'
+        ~ '(?!' ~ (item.1.value | regex_escape) ~ '\\s*(?:#.*)?$).+$'
+      )
+    fail_msg: >-
+      {{ item.0.item }} conflicts with k3s-owned sysctl
+      {{ item.1.key }}={{ item.1.value }}.
+  loop: >-
+    {{ preflight_foreign_sysctl_contents.results
+       | product(k3s_owned_sysctls.default | dict2items) | list }}
+
+- name: Reject foreign files that override caller sysctls at boot
+  # systemd-sysctl applies the files in file-name order and the last value
+  # wins: a file named after ours (99-*.conf, sysctl.conf) would silently
+  # replace a caller value on the next boot, while one named before ours is
+  # overridden by it (Ubuntu's own 10-*.conf defaults).
+  ansible.builtin.assert:
+    that: >-
+      (item.0.content | b64decode) is not regex(
+        '(?m)^\\s*'
+        ~ (item.1.key | replace('/', '.') | split('.') | map('regex_escape') | list | join('[./]'))
+        ~ '\\s*=\\s*'
+        ~ '(?!' ~ (item.1.value | string | regex_escape) ~ '\\s*(?:#.*)?$).+$'
+      )
+    fail_msg: >-
+      {{ item.0.item }} is applied after {{ k3s_sysctl_file }} and overrides
+      sysctls.{{ item.1.key }}={{ item.1.value }}.
+  loop: >-
+    {{ preflight_foreign_sysctl_contents.results
+       | product(sysctls | dict2items) | list }}
+  when: (item.0.item | basename) > (k3s_sysctl_file | basename)
+
+- name: Gather host service facts
+  # Read by the firewall manager check below and the running k3s probe.
+  ansible.builtin.service_facts:
+
+- name: Check whether a ufw configuration exists
+  ansible.builtin.stat:
+    path: /etc/ufw/ufw.conf
+  register: preflight_ufw_conf_file
+  when: firewall_mode == 'managed'
+
+- name: Read the ufw configuration
+  ansible.builtin.slurp:
+    src: /etc/ufw/ufw.conf
+  register: preflight_ufw_conf
+  when:
+    - firewall_mode == 'managed'
+    - preflight_ufw_conf_file.stat.exists
+
+# ufw can be enabled in its config, or already have its chains loaded
+# (disabled in the config and its unit stopped, rules still live). Neither
+# check parses the localized `ufw status` output: the config key is read
+# directly and the runtime probe only uses an exit code (0 = the ufw chain
+# exists, 1 = no such chain). No config file means ufw is not installed,
+# so there is nothing to probe.
+- name: Probe for loaded ufw rules
+  ansible.builtin.command: iptables -n -L ufw-user-input
+  register: preflight_ufw_rules
+  changed_when: false
+  failed_when: preflight_ufw_rules.rc not in [0, 1]
+  when:
+    - firewall_mode == 'managed'
+    - preflight_ufw_conf_file.stat.exists
+
+- name: Reject enabled ufw or loaded ufw rules
+  ansible.builtin.assert:
+    that: >-
+      not preflight_ufw_conf_file.stat.exists
+      or (
+        (preflight_ufw_conf.content | b64decode) is not regex(
+          '(?mi)^\\s*ENABLED\\s*=\\s*["\']?yes["\']?\\s*(?:#.*)?$'
+        )
+        and preflight_ufw_rules.rc != 0
+      )
+    fail_msg: >-
+      ufw is enabled or its rules are loaded; disable it before using
+      firewall_mode=managed.
+  when: firewall_mode == 'managed'
+
+- name: Reject active host firewall managers
+  ansible.builtin.assert:
+    that: >-
+      (item ~ '.service') not in ansible_facts.services
+      or ansible_facts.services[item ~ '.service'].state != 'running'
+    fail_msg: >-
+      {{ item }} is active; disable it before using firewall_mode=managed.
+  loop:
+    - firewalld
+  when: firewall_mode == 'managed'
+
+# --- k3s role, datastore and identity safety ----------------------------
+#
+# Every check below runs before any role changes the host, so a rejected
+# apply never touches config, the datastore or the kubeconfig.
+
+- name: Check for existing k3s units, data and binary
+  ansible.builtin.stat:
+    path: "{{ item.value }}"
+    get_checksum: false
+  loop: "{{ preflight_k3s_paths | dict2items }}"
+  vars:
+    preflight_k3s_paths:
+      agent_unit: /etc/systemd/system/k3s-agent.service
+      server_unit: /etc/systemd/system/k3s.service
+      etcd_datastore: /var/lib/rancher/k3s/server/db/etcd
+      sqlite_datastore: /var/lib/rancher/k3s/server/db/state.db
+      server_data: /var/lib/rancher/k3s/server
+      agent_data: /var/lib/rancher/k3s/agent
+      binary: /usr/local/bin/k3s
+      server_ca: /var/lib/rancher/k3s/server/tls/server-ca.crt
+  register: preflight_k3s_stat
+
+- name: Record which k3s paths exist
+  ansible.builtin.set_fact:
+    preflight_k3s: >-
+      {{ dict(preflight_k3s_stat.results | map(attribute='item.key')
+         | zip(preflight_k3s_stat.results | map(attribute='stat.exists'))) }}
+
+- name: Find k3s service environment files
+  ansible.builtin.find:
+    paths: /etc/systemd/system
+    patterns: 'k3s*.service.env'
+    file_type: file
+  register: preflight_k3s_env_files
+
+- name: Build the k3s unit and environment file list
+  ansible.builtin.set_fact:
+    preflight_k3s_unit_paths: >-
+      {{ (['/etc/systemd/system/k3s.service'] if preflight_k3s.server_unit else [])
+         + (['/etc/systemd/system/k3s-agent.service'] if preflight_k3s.agent_unit else [])
+         + (preflight_k3s_env_files.files | map(attribute='path') | list) }}
+
+- name: Read the k3s unit and environment files
+  # Legacy units and environment files can contain inline credentials.
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop: "{{ preflight_k3s_unit_paths }}"
+  register: preflight_k3s_unit_contents
+  no_log: true
+
+- name: Find data-dir or datastore-endpoint keys in the k3s config files
+  # k3s reads config.yaml and config.yaml.d/*; either can move the data off
+  # the default paths. The files are searched, never read into the run (they
+  # may hold secrets): `contains` matches top-level keys at the start of a
+  # line, in the plain, quoted and append (`+`, also inside the quotes) forms;
+  # `d` is the short data-dir name. The anchor keeps keys that merely end in
+  # `d` (flannel-backend) from matching.
+  ansible.builtin.find:
+    paths: /etc/rancher/k3s
+    recurse: true
+    # `contains` is applied to regular files only: not file_type any.
+    file_type: file
+    follow: true
+    patterns: ['*.yaml', '*.yml']
+    contains: '^["'']?(data-dir|d|datastore-endpoint)\+?["'']?\s*:'
+  register: preflight_k3s_config_overrides
+
+
+- name: Detect a k3s data layout this module cannot manage
+  # Data-dir flags (-d/--data-dir, K3S_DATA_DIR) or datastore endpoints in
+  # units, environment files or the k3s config files move data off the
+  # default paths every classification and identity check below relies on.
+  ansible.builtin.set_fact:
+    preflight_k3s_unmanaged_layout: >-
+      {{ preflight_k3s_config_overrides.matched > 0
+         or preflight_k3s_unit_contents.results | map(attribute='content') | map('b64decode') | join('\n')
+         is search('--data-dir|(?<![\w-])-d\b|K3S_DATA_DIR|--datastore-endpoint|K3S_DATASTORE_ENDPOINT') }}
+    # service_facts, gathered above, also lists units systemd has not loaded.
+    preflight_k3s_live: >-
+      {{ ansible_facts.services | dict2items | selectattr('key', 'in', ['k3s.service', 'k3s-agent.service'])
+         | selectattr('value.state', 'equalto', 'running') | list | length > 0 }}
+
+- name: Check for the module state marker
+  ansible.builtin.stat:
+    path: "{{ k3s_marker_path }}"
+    get_checksum: false
+  register: preflight_installed_marker
+
+- name: Collect the k3s unit bodies
+  ansible.builtin.set_fact:
+    preflight_k3s_unit_bodies: >-
+      {{ preflight_k3s_unit_contents.results
+         | selectattr('item', 'search', '[.]service$')
+         | map(attribute='content') | map('b64decode') | list }}
+  no_log: true
+
+- name: Recognise the module's own unfinished first install
+  # A failed or interrupted first converge leaves the module's own unit
+  # (marked by its header line) and whatever k3s created before it stopped
+  # (server or agent directory, even a cluster CA), but no completion marker.
+  # That is a retryable first install, not an unknown layout; a datastore
+  # (checked before this class) still wins, and a joining node's local CA is
+  # compared with the head's in head.yml. An `initial` node has no head to
+  # compare with, so a server CA keeps it out of this class: cluster-init over
+  # copied bootstrap data would build a second cluster on another's CA. Any foreign unit keeps this false. Environment
+  # files are not judged here: the module's unit never loads one, and one
+  # that moves the datastore is already caught as an unmanaged layout.
+  ansible.builtin.set_fact:
+    preflight_k3s_own_first_install: >-
+      {{ not preflight_installed_marker.stat.exists
+         and (node_type != 'initial' or not preflight_k3s.server_ca)
+         and (preflight_k3s_unit_bodies | length) > 0
+         and (preflight_k3s_unit_bodies | reject('match', '# Managed by k3s-bootstrap$', multiline=True) | list | length) == 0 }}
+
+- name: Classify the existing k3s installation
+  ansible.builtin.set_fact:
+    # The datastore shape tells a refused sqlite state.db from embedded
+    # etcd (initial or a joined server, one shared class: the marker tells
+    # them apart and the CA-identity check catches a cluster switch).
+    # Data is authoritative over units: leftover data with a missing
+    # unit must not classify as none, or a role change would slip past.
+    # k3s present with no recognizable datastore or agent directory (a custom data-dir
+    # moved it all away) or with a unit/env flag that moves the
+    # datastore is 'unknown': the module refuses to guess. A running k3s with
+    # no etcd, sqlite or agent data is 'unknown' too: its data lives somewhere
+    # this module cannot see, and it must never classify as a first install.
+    # The module's own unfinished first install (see above) is 'none', so it
+    # can be retried.
+    preflight_k3s_installed_class: >-
+      {{
+        'unknown' if preflight_k3s_unmanaged_layout | bool else
+        'etcd' if preflight_k3s.etcd_datastore else
+        'sqlite' if preflight_k3s.sqlite_datastore else
+        'none' if preflight_k3s_own_first_install | bool else
+        'unknown' if preflight_k3s_live | bool and not preflight_k3s.agent_data else
+        'unknown' if preflight_k3s.server_unit or preflight_k3s.server_data else
+        'agent' if preflight_k3s.agent_data else
+        'unknown' if (
+          preflight_k3s.binary or preflight_k3s.agent_unit
+        ) else
+        'none'
+      }}
+
+- name: Decide whether the host is untouched by k3s
+  # Only such a host may get the first-install reboot (host role): class
+  # `none` alone also covers the module's own unfinished install, which can
+  # be a joined, running node.
+  ansible.builtin.set_fact:
+    preflight_k3s_pristine: >-
+      {{ preflight_k3s_installed_class == 'none'
+         and not preflight_k3s.server_data
+         and not preflight_k3s.agent_data
+         and not preflight_k3s_live | bool }}
+
+- name: Reject a server or agent unit alongside the opposite requested role
+  ansible.builtin.assert:
+    that:
+      - not (preflight_k3s.server_unit and node_type == 'agent')
+      - not (preflight_k3s.agent_unit and node_type != 'agent')
+    fail_msg: >-
+      An existing k3s server or agent unit conflicts with node_type={{ node_type }};
+      this would change its role or install a second service alongside it,
+      which this module refuses to do automatically.
+
+- name: Refuse an unclassifiable existing k3s installation
+  # The module manages only default-path layouts. An installation whose
+  # datastore it cannot find must not be converged over: the module's
+  # unit would bring up a second, empty cluster.
+  ansible.builtin.assert:
+    that: preflight_k3s_installed_class != 'unknown'
+    fail_msg: >-
+      An existing k3s installation or data-dir/datastore-endpoint
+      configuration was found on this host, but its data layout is unknown
+      to this module (a non-default data-dir or datastore endpoint, a
+      running k3s with no recognizable data, or no recognizable k3s data);
+      this module refuses to converge over it.
+
+- name: Refuse an existing SQLite datastore
+  # The module is etcd only. It never converts SQLite and cannot join a
+  # SQLite server to a cluster; migrating an installation is OOS-1.
+  ansible.builtin.assert:
+    that: preflight_k3s_installed_class != 'sqlite'
+    fail_msg: >-
+      A SQLite k3s datastore (/var/lib/rancher/k3s/server/db/state.db) was
+      found; this module supports embedded etcd only and never converts
+      SQLite (migrating an existing installation is out of scope, OOS-1).
+
+- name: Classify the requested k3s role
+  ansible.builtin.set_fact:
+    preflight_k3s_requested_class: "{{ 'agent' if node_type == 'agent' else 'etcd' }}"
+
+- name: Reject a k3s role, server/agent or datastore change
+  ansible.builtin.assert:
+    that: preflight_k3s_installed_class in ['none', preflight_k3s_requested_class]
+    fail_msg: >-
+      The host already runs a {{ preflight_k3s_installed_class }} k3s
+      installation; node_type={{ node_type }} would change its role or
+      datastore, which this module refuses to do automatically.
+
+- name: Read the module state marker
+  ansible.builtin.slurp:
+    src: "{{ k3s_marker_path }}"
+  register: preflight_installed_marker_body
+  when: preflight_installed_marker.stat.exists
+
+- name: Reject a node type change recorded in the marker
+  # etcd is one class for initial and server, so only the marker can tell
+  # them apart; the marker holds the node type of the converge that wrote it.
+  ansible.builtin.assert:
+    that: (preflight_installed_marker_body.content | b64decode | trim) == node_type
+    fail_msg: >-
+      The module state marker {{ k3s_marker_path }} records node type
+      '{{ preflight_installed_marker_body.content | b64decode | trim }}';
+      node_type={{ node_type }} would change the node type, which this
+      module refuses to do automatically.
+  when: preflight_installed_marker.stat.exists
+
+- name: Read the installed k3s version
+  ansible.builtin.command: k3s --version
+  timeout: 30
+  changed_when: false
+  register: preflight_k3s_version_raw
+  when: preflight_k3s.binary
+
+- name: Extract the installed k3s version pin
+  ansible.builtin.set_fact:
+    preflight_k3s_installed_version: >-
+      {{ preflight_k3s_version_raw.stdout | regex_search('v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+') | default('', true) }}
+  when: preflight_k3s.binary
+
+- name: Reject an unparsable installed k3s version
+  ansible.builtin.assert:
+    that: preflight_k3s_installed_version | length > 0
+    fail_msg: >-
+      Cannot parse the installed k3s version from `k3s --version`; refusing
+      to continue without a downgrade check.
+  when: preflight_k3s.binary
+
+- name: Reject a k3s downgrade
+  ansible.builtin.assert:
+    that: >-
+      (k3s_version | regex_replace('^v', '') | regex_replace('\+k3s', '.') | split('.') | map('int') | list)
+      >=
+      (preflight_k3s_installed_version | regex_replace('^v', '') | regex_replace('\+k3s', '.') | split('.') | map('int') | list)
+    fail_msg: >-
+      k3s_version={{ k3s_version }} would downgrade the installed
+      {{ preflight_k3s_installed_version }}.
+  when: preflight_k3s.binary
+
+- name: Build the required kernel module list
+  ansible.builtin.set_fact:
+    preflight_kernel_modules: "{{ (['br_netfilter', 'overlay'] + kernel_modules) | unique | list }}"
+
+- name: Check that every required kernel module can be loaded
+  # modinfo resolves modules.dep, modules.builtin and aliases without loading
+  # anything, so a missing module fails before the host role loads any.
+  ansible.builtin.command:
+    argv: [modinfo, -n, "{{ item }}"]
+  loop: "{{ preflight_kernel_modules }}"
+  changed_when: false
+
+- name: Check the root filesystem growth layout
+  when: grow_root_filesystem
+  block:
+    - name: Pick the root mount
+      ansible.builtin.set_fact:
+        # A root without a mount fact (a container overlay) is refused below.
+        preflight_root: "{{ ansible_facts.mounts | selectattr('mount', 'equalto', '/') | first | default({}) }}"
+
+    - name: Verify the root filesystem type and device
+      ansible.builtin.assert:
+        that:
+          - preflight_root.device | default('') is match('^/dev/')
+          - preflight_root.fstype | default('') in ['ext4', 'xfs']
+        fail_msg: >-
+          grow_root_filesystem supports only ext4 or xfs on a direct disk
+          partition; set grow_root_filesystem = false for this node.
+
+    - name: Read the root partition's disk and number
+      ansible.builtin.command:
+        argv: [lsblk, --json, --nodeps, -o, "PKNAME,PARTN", "{{ preflight_root.device }}"]
+      register: preflight_root_lsblk
+      changed_when: false
+
+    - name: Verify the root filesystem growth layout
+      vars:
+        preflight_root_part: "{{ (preflight_root_lsblk.stdout | from_json).blockdevices[0] }}"
+      ansible.builtin.assert:
+        that:
+          - preflight_root_part.pkname | default(none) is string
+          - preflight_root_part.partn | default(none) is not none
+        fail_msg: >-
+          grow_root_filesystem supports only ext4 or xfs on a direct disk
+          partition; set grow_root_filesystem = false for this node.
+
+    - name: Name the root disk and partition
+      ansible.builtin.set_fact:
+        preflight_root_disk: "/dev/{{ (preflight_root_lsblk.stdout | from_json).blockdevices[0].pkname }}"
+        preflight_root_partn: "{{ (preflight_root_lsblk.stdout | from_json).blockdevices[0].partn | string }}"
+
+# Runs last: the identity check needs the installed class from above.
+- name: Check the cluster head and the cluster identity
+  ansible.builtin.import_tasks: head.yml
+  when: node_type != 'initial'

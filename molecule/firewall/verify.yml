@@ -1,0 +1,209 @@
+---
+- name: Verify the managed firewall from loopback on the node
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Prove the API and etcd ports answer on loopback
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ item }}"
+        timeout: 5
+      loop: [6443, 2379, 2380]
+
+- name: Verify trust, refusals and foreign-table safety from the controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../shared/vars/module_vars.yml]
+  vars:
+    k3sb_instance: "{{ groups['all'] | first }}"
+    k3sb_foreign_table: inet k3sb_foreign
+  tasks:
+    - name: Prove SSH is reachable on a fresh connection
+      ansible.builtin.include_tasks: tasks/fresh_ssh.yml
+
+    - name: Probe the gated ports from the trusted controller
+      ansible.builtin.include_tasks: tasks/probe.yml
+
+    - name: Assert the trusted controller reaches the API and etcd ports
+      ansible.builtin.assert:
+        that: k3sb_probe == [0, 0, 0]
+
+    - name: Distrust the controller
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+      vars:
+        k3sb_apply_vars: {api_trusted_cidrs: [192.0.2.0/24]}
+
+    - name: Probe the gated ports from the now untrusted controller
+      ansible.builtin.include_tasks: tasks/probe.yml
+
+    - name: SSH stays reachable on a fresh connection whatever the trust list
+      ansible.builtin.include_tasks: tasks/fresh_ssh.yml
+
+    - name: Assert every gated port is dropped (times out), not refused
+      ansible.builtin.assert:
+        that: k3sb_probe == [3, 3, 3]
+
+    - name: Seed a foreign nft table and restore the trusted list
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      ansible.builtin.command:
+        argv: [nft, -f, "-"]
+        stdin: |
+          table {{ k3sb_foreign_table }} {
+            chain keep { type filter hook input priority 10; policy accept; tcp dport 9 counter accept; }
+          }
+      changed_when: true
+
+    - name: Snapshot the foreign table
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      ansible.builtin.command: nft list table {{ k3sb_foreign_table }}
+      changed_when: false
+      register: k3sb_foreign_before
+
+    - name: Restore the trusted list over the foreign table
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+
+    - name: Refuse off mode while the module firewall exists
+      ansible.builtin.include_tasks: ../shared/tasks/reject.yml
+      vars:
+        k3sb_variant_vars: {firewall_mode: 'off'}
+        k3sb_reject_task: 'preflight : Refuse off mode with a module firewall'
+
+    - name: Leave only the unit and ruleset files of the module firewall
+      # Stopping the unit runs its ExecStop, which deletes the table.
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      ansible.builtin.systemd_service:
+        name: k3s-bootstrap-firewall
+        state: stopped
+        enabled: false
+
+    - name: Require the module table to be gone
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      ansible.builtin.command: nft list table inet k3s_bootstrap
+      register: k3sb_table_gone
+      changed_when: false
+      failed_when: k3sb_table_gone.rc == 0
+
+    - name: Apply off mode over the leftover unit file
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+      vars:
+        k3sb_apply_vars: {firewall_mode: 'off'}
+        k3sb_apply_may_fail: true
+
+    - name: Keep the leftover-unit refusal
+      ansible.builtin.set_fact:
+        k3sb_off_leftover: "{{ k3sb_run }}"
+
+    - name: Apply off mode without nft while the unit and ruleset files exist
+      block:
+        - name: Hide nft
+          become: true
+          delegate_to: "{{ k3sb_instance }}"
+          ansible.builtin.command: mv /usr/sbin/nft /usr/sbin/nft.hidden
+          changed_when: true
+
+        - name: Apply off mode without nft
+          ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+          vars:
+            k3sb_apply_vars: {firewall_mode: 'off'}
+            k3sb_apply_may_fail: true
+      always:
+        - name: Restore nft
+          become: true
+          delegate_to: "{{ k3sb_instance }}"
+          ansible.builtin.command: mv /usr/sbin/nft.hidden /usr/sbin/nft
+          changed_when: true
+
+    - name: Assert both off-mode runs were refused by the expected preflight task
+      ansible.builtin.assert:
+        that:
+          - item.0.rc != 0
+          - >-
+            item.0.stdout is regex('TASK \[preflight : ' ~ item.1 ~ '\][^\n]*\n(?:(?!TASK \[)[\s\S])*?fatal:')
+      loop:
+        - ["{{ k3sb_off_leftover }}", Refuse off mode with a module firewall]
+        - ["{{ k3sb_run }}", Require nft to inspect an existing module firewall]
+
+    - name: Remove the unit and ruleset files as the refusal instructs
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      ansible.builtin.shell: |
+        set -eu
+        rm /etc/systemd/system/k3s-bootstrap-firewall.service /etc/k3s-bootstrap/firewall.nft
+        systemctl daemon-reload
+      changed_when: true
+
+    - name: Apply off mode after the manual cleanup
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+      vars:
+        k3sb_apply_vars: {firewall_mode: 'off'}
+
+    - name: Restore the managed firewall
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+
+    - name: Read the foreign table after managed, off and managed again
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      ansible.builtin.command: nft list table {{ k3sb_foreign_table }}
+      changed_when: false
+      register: k3sb_foreign_after
+
+    - name: Assert the foreign table survived every mode
+      ansible.builtin.assert:
+        that: k3sb_foreign_after.stdout == k3sb_foreign_before.stdout
+
+    - name: Refuse an invalid ruleset before it replaces the live table
+      ansible.builtin.include_tasks: ../shared/tasks/reject.yml
+      vars:
+        k3sb_variant_vars: {api_trusted_cidrs: [192.0.2.0/33]}
+        k3sb_reject_task: 'firewall : Install the isolated nftables ruleset'
+
+    - name: Refuse the managed firewall while ufw is enabled
+      block:
+        - name: Enable ufw with SSH allowed
+          become: true
+          delegate_to: "{{ k3sb_instance }}"
+          ansible.builtin.shell: |
+            set -eu
+            ufw allow 22/tcp
+            ufw --force enable
+          changed_when: true
+
+        - name: Apply the managed firewall over enabled ufw
+          ansible.builtin.include_tasks: ../shared/tasks/reject.yml
+          vars:
+            k3sb_variant_vars: {}
+            k3sb_reject_task: 'preflight : Reject enabled ufw or loaded ufw rules'
+
+        - name: Disable ufw in its config only and stop its unit, leaving its chains loaded
+          become: true
+          delegate_to: "{{ k3sb_instance }}"
+          ansible.builtin.shell: |
+            set -eu
+            sed -i 's/^ENABLED=.*/ENABLED=no/' /etc/ufw/ufw.conf
+            systemctl stop ufw
+            iptables -n -L ufw-user-input >/dev/null
+          changed_when: true
+
+        - name: Apply the managed firewall over loaded ufw chains
+          ansible.builtin.include_tasks: ../shared/tasks/reject.yml
+          vars:
+            k3sb_variant_vars: {}
+            k3sb_reject_task: 'preflight : Reject enabled ufw or loaded ufw rules'
+      always:
+        - name: Disable ufw and unload its chains
+          become: true
+          delegate_to: "{{ k3sb_instance }}"
+          ansible.builtin.command: ufw --force disable
+          changed_when: true
+
+    - name: Delete the foreign table
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      ansible.builtin.command: nft delete table {{ k3sb_foreign_table }}
+      changed_when: true

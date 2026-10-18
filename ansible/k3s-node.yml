@@ -1,0 +1,105 @@
+---
+# Prepares one k3s node from the controller over SSH. Run it through
+# `uv run --no-project --with-requirements ansible/requirements.txt ansible-playbook -i localhost, ...`.
+- name: Inventory
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: always
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  roles:
+    - inventory
+
+- name: Preflight
+  hosts: k3s_node
+  remote_user: "{{ bootstrap_user }}"
+  become: true
+  tags: preflight
+  roles:
+    - preflight
+
+- name: Access
+  hosts: k3s_node
+  remote_user: "{{ bootstrap_user }}"
+  become: true
+  tags: access
+  roles:
+    - access
+
+- name: Verify new access
+  hosts: k3s_node
+  remote_user: "{{ ssh_user }}"
+  gather_facts: false
+  become: true
+  tags: [access, ssh_hardening]
+  vars:
+    ansible_user: "{{ ssh_user }}"
+    ansible_ssh_common_args: >-
+      {{ hostvars['localhost'].inventory_ssh_host_key_args }}
+      -o PreferredAuthentications=publickey
+      -o PasswordAuthentication=no
+  tasks:
+    - name: Reset the bootstrap SSH connection
+      ansible.builtin.meta: reset_connection
+
+    - name: Wait for a fresh SSH connection as the new user
+      ansible.builtin.wait_for_connection:
+        timeout: "{{ hostvars['localhost'].inventory_connection_seconds | int }}"
+
+    - name: Verify the new user has passwordless sudo
+      ansible.builtin.command:
+        argv: [id, -u]
+      register: k3s_new_access_uid
+      changed_when: false
+
+    - name: Assert the new user became root
+      ansible.builtin.assert:
+        that: k3s_new_access_uid.stdout | trim == '0'
+        fail_msg: The new SSH user cannot obtain passwordless sudo.
+
+- name: Host
+  hosts: k3s_node
+  remote_user: "{{ ssh_user }}"
+  # No role of this play reads facts; gathering them would connect as ssh_user
+  # even when tags select no task of the play.
+  gather_facts: false
+  become: true
+  pre_tasks:
+    - name: Connect to the node as ssh_user from here on
+      # A node fact, not a play variable: play variables also apply to tasks
+      # delegated to the head, which must keep connecting as head.user. This
+      # play has no play tags, so only --skip-tags always can skip it; a run
+      # without access provisioned then fails to connect, as it should.
+      ansible.builtin.set_fact:
+        ansible_user: "{{ ssh_user }}"
+      tags: always
+  roles:
+    # ssh_hardening comes first: it flushes handlers to reload sshd, which would
+    # run a reboot queued by an earlier role in the middle of its own block.
+    - role: ssh_hardening
+      tags: ssh_hardening
+    - role: host
+      tags: host
+    - role: firewall
+      tags: firewall
+  post_tasks:
+    - name: Run the reboot a first install requested, before k3s is installed
+      ansible.builtin.meta: flush_handlers
+      tags: [host, ssh_hardening]
+
+- name: K3s
+  hosts: k3s_node
+  remote_user: "{{ ssh_user }}"
+  become: true
+  tags: k3s
+  roles:
+    - k3s
+
+- name: Readiness
+  hosts: k3s_node
+  remote_user: "{{ ssh_user }}"
+  become: true
+  tags: readiness
+  roles:
+    - readiness

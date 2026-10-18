@@ -1,0 +1,7 @@
+---
+# Readiness phase. Documented exception (AGENTS.md) to the no-environment-forks
+# rule, the same guard as the k3s role: k3s cannot run in a Docker container,
+# so the container test tier proves only the non-k3s phases.
+- name: Check the k3s predicate
+  ansible.builtin.include_tasks: predicate.yml
+  when: ansible_virtualization_type != 'docker'

@@ -1,0 +1,18 @@
+---
+# Verified against k3s pkg/agent/syssetup/setup.go at the pinned tag. Read by
+# the `preflight` (conflict checks) and `host` (applies them) roles, which run
+# in different plays, so it lives here and not in either role's defaults.
+k3s_owned_sysctls:
+  default:
+    net.bridge.bridge-nf-call-iptables: "1"
+    net.bridge.bridge-nf-call-ip6tables: "1"
+
+# Files of the module read by more than one role (preflight checks them, host
+# and firewall write them), so they live here and not in a role.
+k3s_sysctl_file: /etc/sysctl.d/90-k3s-bootstrap.conf
+k3s_firewall_unit: /etc/systemd/system/k3s-bootstrap-firewall.service
+k3s_firewall_ruleset: /etc/k3s-bootstrap/firewall.nft
+
+# Written by the k3s role once the service is up; holds the node type. Read by
+# preflight, which runs in an earlier play, so it lives here and not in a role.
+k3s_marker_path: /var/lib/k3s-bootstrap/installed

@@ -1,0 +1,29 @@
+---
+# First install of a `server`: the head's server token (k3s writes it as
+# K10<CA hash>::<password>; servers cannot join with a bootstrap token) is
+# read over the head's SSH connection into play memory and written to the
+# node's 0600 token file that config.yaml names. A node with the completion
+# marker never runs this file. Every task that holds the token has no_log and no diff.
+- name: Read the server token of the head
+  ansible.builtin.slurp:
+    src: /var/lib/rancher/k3s/server/token
+  delegate_to: head
+  become: true
+  timeout: 30
+  register: k3s_head_token
+  no_log: true
+
+- name: Write the join token file
+  ansible.builtin.copy:
+    content: "{{ k3s_head_token.content | b64decode | trim }}\n"
+    dest: "{{ k3s_token_file }}"
+    owner: root
+    group: root
+    mode: '0600'
+  diff: false
+  no_log: true
+
+- name: Drop the token from play memory
+  ansible.builtin.set_fact:
+    k3s_head_token: null
+  no_log: true

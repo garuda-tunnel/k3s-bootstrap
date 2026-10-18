@@ -1,0 +1,11 @@
+---
+# Test helper: after registration, make Ansible build the ssh command for the
+# node (run at -vvv; the connection is refused, only the command line matters).
+- import_playbook: ansible/k3s-node.yml
+- name: Probe the ssh command line
+  hosts: node
+  gather_facts: false
+  tags: always
+  tasks:
+    - name: Connect
+      ansible.builtin.ping:

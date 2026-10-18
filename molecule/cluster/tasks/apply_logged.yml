@@ -1,0 +1,14 @@
+---
+# Apply one node at -vvv and keep its first output (force: false: the
+# idempotence converge does not overwrite it). Input: k3sb_instance.
+- name: Apply the module playbook at -vvv
+  ansible.builtin.include_tasks: ../../shared/tasks/apply.yml
+  vars:
+    k3sb_apply_args: [-vvv]
+
+- name: Keep the first converge output of the node
+  ansible.builtin.copy:
+    content: "{{ k3sb_run.stdout }}\n{{ k3sb_run.stderr }}"
+    dest: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/converge-{{ k3sb_instance }}.log"
+    force: false
+    mode: '0600'

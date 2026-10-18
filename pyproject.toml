@@ -1,0 +1,33 @@
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+markers = [
+  "container: Docker-backed integration tests that run the module playbook from the controller against SSH containers",
+  "vm: manual local libvirt VM integration test",
+]
+
+[tool.vulture]
+min_confidence = 60
+paths = ["tests"]
+
+[tool.pylint.main]
+py-version = "3.13"
+ignore-paths = [
+  "tests/vulture_whitelist.py", # Bare names for vulture; not importable code.
+]
+
+[tool.pylint.basic]
+good-names = ["rc", "id"]
+
+[tool.pylint.format]
+max-line-length = 100
+
+[tool.pylint.messages_control]
+# Only what holds for every pytest file; anything else is disabled at its site with a reason.
+disable = [
+  "duplicate-code", # Cross-file check, not disableable per site; tiers repeat command literals.
+  "redefined-outer-name", # Pytest fixture injection reuses fixture names in test signatures.
+]

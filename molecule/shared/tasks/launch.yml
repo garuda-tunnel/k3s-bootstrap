@@ -1,0 +1,31 @@
+---
+# Run a child command that launches a playbook and judge it by its own
+# PLAY RECAP, never by what else it prints: with a suppressed display or
+# another callback the task lines may be hidden, the recap is not. The task
+# is "changed" when the recap's changed counts sum above zero, so Molecule's
+# idempotence step sees every real change in this host's own recap; rc 0
+# without a recap row is an error, not "unchanged".
+# Inputs: k3sb_launch_command (shell string), k3sb_launch_env (dict),
+# k3sb_launch_chdir, optional k3sb_apply_may_fail (a failing child is then
+# asserted by the caller). Output: k3sb_run.
+- name: Run the child launch
+  ansible.builtin.shell: "{{ k3sb_launch_command }}"
+  args:
+    chdir: "{{ k3sb_launch_chdir }}"
+    executable: /bin/sh
+  environment: "{{ k3sb_launch_env }}"
+  register: k3sb_run
+  failed_when: >-
+    (k3sb_run.rc != 0 and not (k3sb_apply_may_fail | default(false)))
+    or (k3sb_run.rc == 0
+        and (k3sb_run.stdout.split('PLAY RECAP')[-1]
+             | regex_findall('^\\S+\\s+:\\s+ok=\\d+\\s+changed=\\d+', multiline=True) | length) == 0)
+  changed_when: >-
+    'PLAY RECAP' in k3sb_run.stdout
+    and (k3sb_run.stdout.split('PLAY RECAP')[-1]
+         | regex_findall('^\\S+\\s+:\\s+ok=\\d+\\s+changed=(\\d+)', multiline=True)
+         | map('int') | sum) > 0
+
+- name: Show the child output
+  ansible.builtin.debug:
+    var: k3sb_run.stdout_lines

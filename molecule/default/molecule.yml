@@ -1,0 +1,39 @@
+---
+dependency:
+  name: galaxy
+  enabled: false
+driver:
+  name: vagrant
+  provider:
+    name: libvirt
+  parallel: true
+platforms:
+  - name: k3sb-molecule-default
+    box: cloud-image/ubuntu-26.04
+    box_version: 20260927.0.0
+    memory: 2048
+    cpus: 2
+    config_options:
+      synced_folder: false
+      vm.box_check_update: false
+    provider_options:
+      uri: qemu:///system
+      driver: kvm
+      default_prefix: k3sb-molecule-
+      management_network_name: default
+      management_network_address: 192.168.122.0/24
+      management_network_keep: true
+provisioner:
+  name: ansible
+  inventory:
+    host_vars:
+      k3sb-molecule-default:
+        # The kubeconfig group must be the login user's real primary group,
+        # which is only meaningful when it differs from the user name.
+        k3s_node: {node_type: initial, ssh_user: ops}
+  playbooks:
+    prepare: prepare.yml
+    converge: ../shared/converge.yml
+    verify: verify.yml
+scenario:
+  test_sequence: [create, prepare, converge, idempotence, verify, destroy]

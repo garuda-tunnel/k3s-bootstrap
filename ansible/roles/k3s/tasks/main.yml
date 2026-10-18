@@ -1,0 +1,330 @@
+---
+# Installs the pinned k3s for one node type: `initial` bootstraps the
+# embedded-etcd cluster (k3s generates the cluster token itself; this role
+# never reads it there), `server` joins through the head with the head's
+# server token (tasks/join_server.yml), `agent` with a short-lived bootstrap
+# token that is deleted on the head when the run ends (tasks/join_agent.yml).
+#
+# k3s itself needs containerd snapshotting and cgroup delegation that
+# nested Docker containers cannot provide. The container test tier
+# therefore proves the access/SSH phases only; k3s itself is proven on
+# real VMs by the molecule scenarios (molecule/). Documented exception
+# (AGENTS.md) to the no-environment-forks rule: no supported host of this
+# module (Ubuntu 26.04 VM) is ever a Docker container.
+- name: Converge k3s
+  when: ansible_virtualization_type != 'docker'
+  block:
+    - name: Require the preflight play of this run
+      # Its facts decide the install and guard the datastore.
+      ansible.builtin.assert:
+        that: preflight_k3s_installed_class is defined
+        fail_msg: The k3s play needs the preflight play of the same run (do not skip the preflight tag).
+
+    - name: Resolve the kubeconfig group of a server
+      # An agent has no kubeconfig: its config directory stays root-only.
+      when: node_type != 'agent'
+      block:
+        - name: Look up the SSH user's passwd entry
+          ansible.builtin.getent:
+            database: passwd
+            key: "{{ ssh_user }}"
+
+        - name: Look up the SSH user's primary group
+          ansible.builtin.getent:
+            database: group
+            key: "{{ ansible_facts.getent_passwd[ssh_user][2] }}"
+
+        - name: Resolve the kubeconfig group name
+          # getent_group is keyed by the group name even when queried by GID;
+          # write-kubeconfig-group needs that name rather than the numeric GID.
+          ansible.builtin.set_fact:
+            k3s_kubeconfig_group: >-
+              {{ ansible_facts.getent_group | dict2items
+                 | selectattr('value.1', 'equalto', ansible_facts.getent_passwd[ssh_user][2])
+                 | map(attribute='key') | first }}
+
+    - name: Render the full k3s config
+      # The module-owned keys always win over k3s_config. A joining node keeps
+      # `server` and `token-file` on every converge, so a joined re-run renders
+      # the same file. An IPv6 head address is bracketed in the URL.
+      vars:
+        k3s_head_address: "{{ ('[' ~ head.host ~ ']') if ':' in head.host else head.host }}"
+        k3s_server_keys:
+          tls-san: "{{ (k3s_config.get('tls-san', []) + ['127.0.0.1']) | unique }}"
+          write-kubeconfig-mode: '0640'
+          write-kubeconfig-group: "{{ k3s_kubeconfig_group | default(none) }}"
+      ansible.builtin.set_fact:
+        k3s_rendered_config: >-
+          {{ k3s_config
+             | combine({} if node_type == 'agent' else k3s_server_keys)
+             | combine({'cluster-init': true} if node_type == 'initial'
+                       else {'server': 'https://' ~ k3s_head_address ~ ':6443',
+                             'token-file': k3s_token_file}) }}
+
+    - name: Create the k3s config directory
+      # A server's SSH user primary group (also the group of k3s.yaml) may
+      # traverse but not list it, so k3s.yaml (0640) is reachable while
+      # config.yaml stays private (0600 root). An agent's stays root-only.
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        owner: root
+        group: "{{ 'root' if node_type == 'agent' else k3s_kubeconfig_group }}"
+        mode: "{{ '0700' if node_type == 'agent' else '0710' }}"
+
+    - name: Wait until the node reaches the head's API port
+      ansible.builtin.wait_for:
+        host: "{{ head.host }}"
+        port: 6443
+        timeout: "{{ hostvars['localhost'].inventory_connection_seconds | int }}"
+        msg: >-
+          The node cannot reach the head's k3s API at {{ head.host }}:6443; when
+          the head runs the managed firewall, add this node's address to the
+          head's api_trusted_cidrs.
+      when:
+        - node_type != 'initial'
+        - not preflight_installed_marker.stat.exists or preflight_k3s_installed_class == 'none'
+
+    - name: Write the join token until a converge completed
+      # The marker, written last, is the only proof the node joined: a run
+      # that failed after k3s created its data (or an agent whose rejoin the
+      # operator asked for by removing the marker) gets fresh join data, and
+      # so does a node whose k3s was uninstalled under its marker.
+      ansible.builtin.include_tasks: "join_{{ node_type }}.yml"
+      when:
+        - node_type != 'initial'
+        - not preflight_installed_marker.stat.exists or preflight_k3s_installed_class == 'none'
+
+    - name: Install the k3s config file
+      # Module-owned and rewritten on every converge from k3s_config, so the
+      # inputs stay the one source of truth. Settings managed outside the
+      # module go to /etc/rancher/k3s/config.yaml.d/, which k3s merges after
+      # this file and the module never writes (README, operator duties).
+      ansible.builtin.template:
+        src: config.yaml.j2
+        dest: /etc/rancher/k3s/config.yaml
+        owner: root
+        group: root
+        mode: '0600'
+      diff: false
+
+    - name: Decide whether the installer needs to run
+      # preflight_k3s_installed_version is set by the preflight play of this
+      # run (only when a binary exists, and only once it parsed).
+      ansible.builtin.set_fact:
+        k3s_install_needed: "{{ preflight_k3s_installed_version | default('') != k3s_version }}"
+
+    - name: Download the k3s installer
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/k3s-io/k3s/{{ k3s_version }}/install.sh"
+        dest: /usr/local/bin/k3s-install.sh
+        mode: '0700'
+      when: k3s_install_needed | bool
+
+    - name: Check the downloaded installer
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s-install.sh
+      register: k3s_installer_file
+      when: k3s_install_needed | bool
+
+    - name: Reject an empty installer download
+      # The installer is fetched to a file and checked non-empty before
+      # use, so a truncated download is never executed.
+      ansible.builtin.assert:
+        that: k3s_installer_file.stat.size > 0
+        fail_msg: "Downloaded k3s installer for {{ k3s_version }} is empty."
+      when: k3s_install_needed | bool
+
+    - name: Create the directory for the installer's own units
+      ansible.builtin.file:
+        path: /var/lib/k3s-bootstrap/installer
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: k3s_install_needed | bool
+
+    - name: Run the k3s installer
+      # Binary management only: enablement and start are skipped and the
+      # upstream unit goes to a directory systemd never reads, because the
+      # module owns the unit file below; so an interrupted install never
+      # leaves an unmarked unit, and an adopted installation with the same
+      # pin never runs upstream install.sh.
+      ansible.builtin.command: sh /usr/local/bin/k3s-install.sh
+      environment:
+        INSTALL_K3S_SYSTEMD_DIR: /var/lib/k3s-bootstrap/installer
+        INSTALL_K3S_VERSION: "{{ k3s_version }}"
+        INSTALL_K3S_EXEC: "{{ 'agent' if node_type == 'agent' else 'server' }}"
+        INSTALL_K3S_SKIP_ENABLE: 'true'
+        INSTALL_K3S_SKIP_START: 'true'
+      changed_when: true
+      when: k3s_install_needed | bool
+
+    - name: Install the k3s systemd unit
+      # Runs after the installer, which rewrites the upstream unit; this
+      # template is the authoritative service definition.
+      ansible.builtin.template:
+        src: k3s.service.j2
+        dest: "/etc/systemd/system/{{ k3s_service_name }}.service"
+        owner: root
+        group: root
+        mode: '0644'
+      diff: false
+
+    # Reconcile the service from host state alone, not from what this run
+    # changed: a run interrupted before its restart leaves unchanged inputs
+    # behind, so only a comparison with the running process catches the
+    # restart it lost. A first install is then started exactly once.
+    - name: Enable the k3s unit
+      ansible.builtin.systemd_service:
+        name: "{{ k3s_service_name }}"
+        enabled: true
+        daemon_reload: true
+
+    - name: Read the k3s unit state and invocation
+      community.general.systemd_info:
+        unitname: ["{{ k3s_unit }}"]
+        extra_properties: [InvocationID]
+      register: k3s_unit_probe
+
+    - name: Note whether a k3s process already runs
+      # `activating` counts: a Type=notify k3s that cannot finish starting (an
+      # agent stuck on a rejected token) stays there, and a start request would
+      # leave it so; only a restart makes it read the new inputs.
+      ansible.builtin.set_fact:
+        k3s_was_live: "{{ k3s_unit_probe.units[k3s_unit].activestate in ['active', 'activating', 'reloading'] }}"
+
+    - name: Read when the running k3s process started
+      # Not systemd_info: it returns the timestamp as display text; only
+      # `systemctl show --timestamp=unix` gives the epoch.
+      ansible.builtin.command:
+        argv: [systemctl, show, "{{ k3s_service_name }}", -p, ExecMainStartTimestamp, --value, --timestamp=unix]
+      register: k3s_started_at
+      changed_when: false
+      # Empty while no main process ran yet (activating before its first exec):
+      # treated as older than every input.
+      failed_when: k3s_started_at.rc != 0 or k3s_started_at.stdout is not match('^(@[0-9]+)?$')
+      when: k3s_was_live | bool
+
+    - name: Read the modification times of the managed inputs
+      # The join token file does not exist on an initial node. The fragment
+      # directory's own mtime moves when a fragment is added or removed.
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: false
+      loop:
+        - /etc/rancher/k3s/config.yaml
+        - "/etc/systemd/system/{{ k3s_service_name }}.service"
+        - /usr/local/bin/k3s
+        - "{{ k3s_token_file }}"
+        - /etc/rancher/k3s/config.yaml.d
+      register: k3s_input_stats
+      when: k3s_was_live | bool
+
+    - name: Read the modification times of the config fragments
+      # k3s reads hidden and symlinked fragments too.
+      ansible.builtin.find:
+        paths: /etc/rancher/k3s/config.yaml.d
+        hidden: true
+        file_type: any
+      register: k3s_config_fragments
+      when:
+        - k3s_was_live | bool
+        - k3s_input_stats.results[-1].stat.isdir | default(false)
+
+    - name: Decide whether k3s needs a restart
+      # An input newer than the process was written after it started. Whole
+      # seconds, as systemd reports them: a file written in the start second
+      # itself counts as older.
+      ansible.builtin.set_fact:
+        k3s_restart_needed: >-
+          {{ k3s_was_live | bool
+             and (k3s_input_stats.results | selectattr('stat.exists') | map(attribute='stat.mtime') | list
+                  + k3s_config_fragments.files | default([]) | map(attribute='mtime') | list)
+                 | select('gt', k3s_started_at.stdout[1:] | int + 1) | list | length > 0 }}
+
+    - name: Request the k3s start or restart job
+      # no_block: the request only queues the job, so the poll below owns the
+      # whole wait and one deadline bounds it even when the first job fails
+      # (a joiner against a cold initializer; Restart=always retries it) or
+      # hangs (the unit has no start timeout: TimeoutStartSec=0).
+      ansible.builtin.systemd_service:
+        name: "{{ k3s_unit }}"
+        state: "{{ 'restarted' if k3s_restart_needed | bool else 'started' }}"
+        no_block: true
+      when: not k3s_was_live | bool or k3s_restart_needed | bool
+
+    - name: Start the readiness deadline
+      ansible.builtin.set_fact:
+        k3s_wait_deadline: "{{ now(utc=true).timestamp() | int + hostvars['localhost'].inventory_readiness_seconds | int }}"
+
+    - name: Wait until the k3s unit is up
+      block:
+        - name: Wait until the k3s unit is active
+          # Bounded by readiness_timeout on the wall clock: the loop also stops
+          # at the deadline (the retry count is only a backstop). A restart
+          # additionally requires a new, non-empty InvocationID: the old process
+          # reports ActiveState=active until it is actually replaced, so a failed
+          # restart (bad config) never passes.
+          community.general.systemd_info:
+            unitname: ["{{ k3s_unit }}"]
+            extra_properties: [InvocationID]
+          register: k3s_unit_state
+          failed_when: >-
+            not (k3s_unit_state.units[k3s_unit].activestate == 'active'
+                 and (not k3s_restart_needed | bool
+                      or k3s_unit_state.units[k3s_unit].invocationid
+                         not in ['', k3s_unit_probe.units[k3s_unit].invocationid]))
+          until: k3s_unit_state is not failed or now(utc=true).timestamp() | int >= k3s_wait_deadline | int
+          retries: "{{ hostvars['localhost'].inventory_readiness_seconds | int // 5 + 1 }}"
+          delay: 5
+      rescue:
+        - name: Collect the k3s journal tail
+          # timeout(1) bounds journalctl itself; the failure message below
+          # stands even when the journal cannot be read.
+          ansible.builtin.command:
+            argv: [timeout, "30", journalctl, -u, "{{ k3s_service_name }}", -n, "30", --no-pager, -o, cat]
+          register: k3s_journal_tail
+          changed_when: false
+          failed_when: false
+
+        - name: Fail with the journal tail when k3s never became active
+          ansible.builtin.fail:
+            msg: >-
+              The k3s unit {{ k3s_service_name }} did not
+              {{ 'restart under a new invocation' if k3s_restart_needed | bool else 'start' }}
+              within {{ readiness_timeout }}. Journal tail:
+              {{ k3s_journal_tail.stdout | default('') }}
+
+    - name: Create the module state directory
+      ansible.builtin.file:
+        path: "{{ k3s_marker_path | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Record the node type once the service is up
+      # Written last, so a failed first install leaves no marker and stays
+      # retryable. Preflight reads it to refuse a node type change.
+      ansible.builtin.copy:
+        content: "{{ node_type }}\n"
+        dest: "{{ k3s_marker_path }}"
+        owner: root
+        group: root
+        mode: '0644'
+  always:
+    - name: Delete the agent's bootstrap token on the head
+      # Also after a failed join; the token's TTL is the backstop when the
+      # controller dies before this runs. The id is not a secret.
+      ansible.builtin.command:
+        argv: [timeout, "60", k3s, token, delete, "{{ k3s_bootstrap_token_id }}"]
+      delegate_to: head
+      become: true
+      changed_when: true
+      register: k3s_bootstrap_token_delete
+      # Exit code only, as for the mint (join_agent.yml).
+      until: k3s_bootstrap_token_delete.rc == 0
+      retries: 6
+      delay: 5
+      when: k3s_bootstrap_token_id | default('') is match('^[a-z0-9]{6}$')

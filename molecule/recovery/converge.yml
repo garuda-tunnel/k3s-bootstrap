@@ -1,0 +1,14 @@
+---
+# Converge the initial node, retry the agent whose first join failed in
+# prepare.yml, and adopt the legacy etcd installation.
+- name: Apply the module playbook to every node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../shared/vars/module_vars.yml]
+  tasks:
+    - name: Apply the module playbook
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+      loop: [k3sb-molecule-recovery-init, k3sb-molecule-recovery-agent, k3sb-molecule-recovery-adopt]
+      loop_control:
+        loop_var: k3sb_instance

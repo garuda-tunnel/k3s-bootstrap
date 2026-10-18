@@ -1,0 +1,38 @@
+---
+# Record the root disk, partition and filesystem sizes (bytes) and the test
+# data hashes in the fact named by k3sb_rootfs_name. Runs in rootfs.yml's
+# localhost play; inputs: k3sb_instance, k3sb_root_disk, k3sb_root_part.
+- name: Read the root sizes and the test data
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  block:
+    - name: Read the disk and partition sizes
+      # sysfs reports block device sizes in 512-byte sectors.
+      ansible.builtin.slurp:
+        src: "/sys/class/block/{{ item }}/size"
+      loop: ["{{ k3sb_root_disk }}", "{{ k3sb_root_part }}"]
+      register: k3sb_rootfs_blocks
+
+    - name: Read the root filesystem size
+      ansible.builtin.setup:
+        gather_subset: [mounts]
+      delegate_facts: true
+
+    - name: Hash the test data
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop: [/var/tmp/k3sb-rootfs-marker, /var/tmp/k3sb-rootfs-blob]
+      register: k3sb_rootfs_data
+
+- name: Record the root sizes and the test data
+  vars:
+    k3sb_sectors: "{{ k3sb_rootfs_blocks.results | map(attribute='content') | map('b64decode') | map('int') | list }}"
+  ansible.builtin.set_fact:
+    "{{ k3sb_rootfs_name }}":
+      disk: "{{ k3sb_sectors[0] * 512 }}"
+      part: "{{ k3sb_sectors[1] * 512 }}"
+      fs: >-
+        {{ hostvars[k3sb_instance].ansible_facts.mounts | selectattr('mount', 'equalto', '/')
+           | map(attribute='size_total') | first }}
+      data: "{{ k3sb_rootfs_data.results | map(attribute='stat.checksum') | list }}"

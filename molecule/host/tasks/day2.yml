@@ -1,0 +1,46 @@
+---
+# A host-requested reboot must not reboot a node that is already installed
+# (day 2). The scenario's node is a real installed k3s by now. A node with an
+# etcd datastore is never pristine, with or without the module marker, so no
+# adopted-node variant is needed. Input: k3sb_instance.
+- name: Ask for a reboot
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  ansible.builtin.copy:
+    content: "*** System restart required ***\n"
+    dest: /run/reboot-required
+    mode: '0644'
+
+- name: Snapshot before the run
+  ansible.builtin.include_tasks: snapshot.yml
+  vars:
+    k3sb_snapshot_name: k3sb_day2_before
+
+- name: Apply the module
+  ansible.builtin.include_tasks: ../../shared/tasks/apply.yml
+
+- name: Snapshot after the run
+  ansible.builtin.include_tasks: snapshot.yml
+  vars:
+    k3sb_snapshot_name: k3sb_day2_after
+
+- name: Look for the request the module must have left alone
+  ansible.builtin.stat:
+    path: /run/reboot-required
+    get_checksum: false
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  register: k3sb_day2_request
+
+- name: Assert the node did not reboot and the request is untouched
+  ansible.builtin.assert:
+    that:
+      - k3sb_day2_after == k3sb_day2_before
+      - k3sb_day2_request.stat.exists
+
+- name: Remove the request
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  ansible.builtin.file:
+    path: /run/reboot-required
+    state: absent

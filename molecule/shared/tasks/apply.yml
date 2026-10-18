@@ -1,0 +1,25 @@
+---
+# Apply the real module playbook to one instance from the controller, with the
+# launch of the module's main.tf `local-exec`: the same command, the node's
+# inputs as one JSON string in K3SB_VARS and ANSIBLE_CONFIG. Test-only overrides,
+# named here: ANSIBLE_COLLECTIONS_PATH is blanked because Molecule exports its
+# own (user directory) into every child, and SSH_AUTH_SOCK is blanked so no
+# agent can stand in for the controller key. See launch.yml for how the run is
+# judged. Inputs: k3sb_instance (inventory name); optional k3sb_apply_vars (dict
+# merged over the instance's module variables), k3sb_apply_args (extra
+# ansible-playbook arguments, for example -vvv) and k3sb_apply_may_fail.
+- name: Compute the module variables of the instance
+  ansible.builtin.include_tasks: describe.yml
+
+- name: Launch ansible/k3s-node.yml like the module does
+  ansible.builtin.include_tasks: launch.yml
+  vars:
+    k3sb_final_vars: "{{ k3sb_node_vars | combine(k3sb_apply_vars | default({}), recursive=True) }}"
+    k3sb_launch_chdir: "{{ lookup('ansible.builtin.env', 'MOLECULE_PROJECT_DIRECTORY') }}"
+    k3sb_module_command: 'uv run --no-project --with-requirements ansible/requirements.txt ansible-playbook -i localhost, ansible/k3s-node.yml -e "$K3SB_VARS"'
+    k3sb_launch_command: "{{ ([k3sb_module_command] + (k3sb_apply_args | default([]) | map('quote') | list)) | join(' ') }}"
+    k3sb_launch_env:
+      K3SB_VARS: "{{ k3sb_final_vars | to_json }}"
+      ANSIBLE_CONFIG: "{{ k3sb_launch_chdir }}/ansible/ansible.cfg"
+      ANSIBLE_COLLECTIONS_PATH: ""
+      SSH_AUTH_SOCK: ""

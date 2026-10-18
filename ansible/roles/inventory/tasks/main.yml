@@ -1,0 +1,127 @@
+---
+- name: Read the pins of requirements.txt
+  # The only pin source: bare `name==version` lines (no comments).
+  ansible.builtin.set_fact:
+    inventory_pins: >-
+      {{ dict(lookup('ansible.builtin.file', role_path ~ '/../../requirements.txt').splitlines()
+      | select('match', '^[A-Za-z]') | map('split', '==') | list) }}
+
+- name: Read the installed ansible package version
+  ansible.builtin.command:
+    argv: ["{{ ansible_playbook_python }}", "-c", "import importlib.metadata as m; print(m.version('ansible'))"]
+  register: inventory_ansible_package
+  changed_when: false
+  check_mode: false
+
+- name: Assert the pinned controller toolchain
+  ansible.builtin.assert:
+    that:
+      - inventory_pins['ansible-core'] is defined
+      - inventory_pins['ansible'] is defined
+      - ansible_version.full == inventory_pins['ansible-core']
+      - inventory_ansible_package.stdout | trim == inventory_pins['ansible']
+    fail_msg: >-
+      Controller toolchain differs from the pin in requirements.txt ({{ inventory_pins }}):
+      ansible-core {{ ansible_version.full }}, ansible {{ inventory_ansible_package.stdout | trim }}.
+      Run through `uv run --no-project --with-requirements ansible/requirements.txt`.
+
+- name: Resolve a module of each pinned collection
+  # Verbosity off: at -v and above ansible-doc prints more than the JSON.
+  environment:
+    ANSIBLE_VERBOSITY: "0"
+  ansible.builtin.command:
+    argv: >-
+      {{ [ansible_playbook_python | dirname ~ '/ansible-doc', '-t', 'module', '-j']
+      + inventory_required_modules }}
+  register: inventory_module_docs
+  changed_when: false
+  check_mode: false
+
+- name: Assert the pinned collections resolve
+  ansible.builtin.assert:
+    that: inventory_required_modules | difference((inventory_module_docs.stdout | from_json).keys() | list) | length == 0
+    fail_msg: >-
+      A pinned collection is not resolvable: {{ inventory_required_modules
+      | difference((inventory_module_docs.stdout | from_json).keys() | list) }} not found.
+      Run through `uv run --no-project --with-requirements ansible/requirements.txt`.
+
+# Types, required inputs and allowed values are checked by meta/argument_specs.yml
+# on role entry; these are the rules that format cannot express.
+- name: Assert the head matches the node type
+  ansible.builtin.assert:
+    that: (node_type == 'initial') == (head | default(none) is none)
+    fail_msg: >-
+      head ({{ head | default(none) }}) is required for server and agent and forbidden for initial.
+
+- name: Assert the timeout formats
+  # variables.tf checks the same at plan time; the conversion below relies on it.
+  ansible.builtin.assert:
+    that:
+      - connection_timeout is match('^[1-9][0-9]*[smh]$')
+      - readiness_timeout is match('^[1-9][0-9]*[smh]$')
+    fail_msg: connection_timeout and readiness_timeout must match ^[1-9][0-9]*[smh]$.
+
+- name: Refuse root as the SSH user
+  ansible.builtin.assert:
+    that: ssh_user != 'root'
+    fail_msg: >-
+      ssh_user must not be root: the module provisions a non-root admin user
+      and reaches root through sudo.
+
+- name: Refuse k3s_config keys that bypass the module's data safety
+  ansible.builtin.assert:
+    that: k3s_config.keys() | intersect(['cluster-reset', 'cluster-reset-restore-path']) | length == 0
+    fail_msg: >-
+      k3s_config must not set cluster-reset or cluster-reset-restore-path:
+      they wipe or replace the datastore outside this module's safety checks.
+
+- name: Derive the connection settings every play reads
+  # Read by later plays and handlers as hostvars['localhost'].<name>.
+  ansible.builtin.set_fact:
+    inventory_connection_seconds: "{{ connection_timeout[:-1] | int * inventory_duration_units[connection_timeout[-1]] }}"
+    inventory_readiness_seconds: "{{ readiness_timeout[:-1] | int * inventory_duration_units[readiness_timeout[-1]] }}"
+    inventory_ssh_host_key_args: >-
+      {{ '-o StrictHostKeyChecking=yes' if host_key_check
+      else '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' }}
+
+- name: Probe the permanent SSH user
+  ansible.builtin.command:
+    argv: >-
+      {{ ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=' ~ inventory_connection_seconds,
+      '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no']
+      + (inventory_ssh_host_key_args | split(' '))
+      + ['-i', ssh_private_key_file, '-p', port | string,
+      ssh_user ~ '@' ~ host, 'true'] }}
+  register: inventory_ssh_user_probe
+  changed_when: false
+  failed_when: false
+
+- name: Select the SSH connection user
+  ansible.builtin.set_fact:
+    inventory_connection_user: >-
+      {{ ssh_user if inventory_ssh_user_probe.rc == 0 else bootstrap_user }}
+
+- name: Add the target node
+  ansible.builtin.add_host:
+    name: node
+    groups: k3s_node
+    ansible_host: "{{ host }}"
+    ansible_port: "{{ port }}"
+    ansible_user: "{{ inventory_connection_user }}"
+    ansible_ssh_private_key_file: "{{ ssh_private_key_file }}"
+    ansible_ssh_common_args: "{{ inventory_ssh_host_key_args }}"
+    ansible_host_key_checking: "{{ host_key_check }}"
+  changed_when: false
+
+- name: Add the cluster head
+  ansible.builtin.add_host:
+    name: head
+    groups: k3s_head
+    ansible_host: "{{ head.host }}"
+    ansible_port: "{{ head.port | default(22) }}"
+    ansible_user: "{{ head.user }}"
+    ansible_ssh_private_key_file: "{{ ssh_private_key_file }}"
+    ansible_ssh_common_args: "{{ inventory_ssh_host_key_args }}"
+    ansible_host_key_checking: "{{ host_key_check }}"
+  when: node_type != 'initial'
+  changed_when: false

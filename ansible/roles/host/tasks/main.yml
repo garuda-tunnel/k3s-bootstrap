@@ -1,0 +1,107 @@
+---
+- name: Load required kernel modules
+  # Fails on a module that is neither loadable nor built in; the module
+  # itself accepts built-in functionality (modules.builtin).
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ preflight_kernel_modules }}"
+
+- name: Persist required kernel modules across reboots
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k3s-bootstrap.conf
+    content: "{{ preflight_kernel_modules | join('\n') + '\n' }}"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Configure k3s-owned sysctls
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_file: "{{ k3s_sysctl_file }}"
+    reload: true
+  loop: "{{ k3s_owned_sysctls.default | dict2items }}"
+
+- name: Configure caller sysctls
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_file: "{{ k3s_sysctl_file }}"
+    reload: true
+  loop: "{{ sysctls | dict2items }}"
+
+# Preflight verified the layout and named preflight_root, preflight_root_disk
+# and preflight_root_partn before any change.
+- name: Grow the root partition and filesystem
+  when: grow_root_filesystem
+  block:
+    - name: Install root filesystem growth tools
+      ansible.builtin.apt:
+        name: cloud-guest-utils
+        state: present
+        update_cache: true
+
+    # growpart --dry-run exits 0 when the partition can grow and 1 when it
+    # already fills the disk (boot tooling such as cloud-init growroot may
+    # have grown it); any other code is a real failure. Only the exit code
+    # is read, never the message.
+    - name: Check whether the root partition can grow
+      ansible.builtin.command:
+        argv: [growpart, --dry-run, "{{ preflight_root_disk }}", "{{ preflight_root_partn }}"]
+      register: host_growpart_dry_run
+      changed_when: false
+      failed_when: host_growpart_dry_run.rc not in [0, 1]
+
+    - name: Grow the root partition
+      ansible.builtin.command:
+        argv: [growpart, "{{ preflight_root_disk }}", "{{ preflight_root_partn }}"]
+      changed_when: true
+      when: host_growpart_dry_run.rc == 0
+
+    - name: Read the root filesystem size before growth
+      ansible.builtin.command:
+        argv: [findmnt, -bno, SIZE, /]
+      register: host_root_size_before
+      changed_when: false
+      failed_when: host_root_size_before.stdout | trim is not match('^[0-9]+$')
+
+    # Not community.general.filesystem (resizefs): it compares an ext4 size
+    # with the device size and reports a change on every run, because ext4
+    # leaves a few blocks of the partition unused. resize2fs and xfs_growfs
+    # are no-ops on a full filesystem, so the size read below reports the
+    # change, never the tool output.
+    - name: Grow the root filesystem into its partition
+      ansible.builtin.command:
+        argv: "{{ ['resize2fs', preflight_root.device] if preflight_root.fstype == 'ext4' else ['xfs_growfs', '/'] }}"
+      changed_when: false
+
+    - name: Report whether the root filesystem grew
+      ansible.builtin.command:
+        argv: [findmnt, -bno, SIZE, /]
+      register: host_root_size_after
+      changed_when: host_root_size_after.stdout | int > host_root_size_before.stdout | int
+      failed_when: host_root_size_after.stdout | trim is not match('^[0-9]+$')
+
+# A first install is the only time the module reboots, and only on a host k3s
+# has not touched (preflight_k3s_pristine: class `none`, no server or agent
+# data, no running k3s). On any other node a host-requested reboot stays the
+# operator's decision. The request is cleared by the reboot
+# itself, so a rerun after a successful reboot does not ask again.
+- name: Look for a host reboot request
+  ansible.builtin.stat:
+    path: /run/reboot-required
+    get_checksum: false
+  register: host_reboot_request
+
+- name: Request a reboot before k3s is installed
+  # Needs the preflight play of the same run (preflight_k3s_pristine).
+  ansible.builtin.debug:
+    msg: The host asks for a reboot and has no k3s yet; rebooting before the install.
+  changed_when: true
+  notify: reboot required
+  when:
+    - host_reboot_request.stat.exists
+    - preflight_k3s_pristine | bool

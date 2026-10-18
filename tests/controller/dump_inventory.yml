@@ -1,0 +1,23 @@
+---
+# Test helper, copied next to a copy of ansible/: registers the inventory twice
+# (idempotence) and prints what was registered for node and head.
+- import_playbook: ansible/k3s-node.yml
+- import_playbook: ansible/k3s-node.yml
+- name: Dump the registered inventory
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: always
+  vars:
+    k3s_keys: '^(ansible_(host|port|user|ssh_)|group_names)'
+  tasks:
+    - name: Print node and head vars
+      vars:
+        dump:
+          node: "{{ hostvars['node'] | dict2items | selectattr('key', 'match', k3s_keys) | items2dict }}"
+          selected_user: "{{ hostvars['localhost'].inventory_connection_user }}"
+          head: >-
+            {{ (hostvars['head'] | dict2items | selectattr('key', 'match', k3s_keys) | items2dict)
+            if 'head' in hostvars else none }}
+      ansible.builtin.debug:
+        msg: "K3SB_DUMP {{ dump | to_json }}"

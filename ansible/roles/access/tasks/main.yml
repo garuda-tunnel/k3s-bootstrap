@@ -1,0 +1,29 @@
+---
+- name: Look up the SSH user
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ ssh_user }}"
+    fail_key: false
+  register: access_passwd_lookup
+
+- name: Create the SSH user when absent
+  ansible.builtin.user:
+    name: "{{ ssh_user }}"
+    create_home: true
+  when: not access_passwd_lookup.ansible_facts.getent_passwd[ssh_user]
+
+- name: Authorize SSH keys
+  ansible.posix.authorized_key:
+    user: "{{ ssh_user }}"
+    key: "{{ item }}"
+    exclusive: false
+  loop: "{{ authorized_keys | unique | list }}"
+
+- name: Install passwordless sudo access
+  ansible.builtin.template:
+    src: sudoers.j2
+    dest: /etc/sudoers.d/90-k3s-bootstrap
+    owner: root
+    group: root
+    mode: '0440'
+    validate: visudo -cf %s

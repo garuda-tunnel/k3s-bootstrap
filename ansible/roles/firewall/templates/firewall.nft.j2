@@ -1,0 +1,35 @@
+{% set trusted_cidrs = api_trusted_cidrs + cluster_cidrs %}
+{% set ipv4_cidrs = trusted_cidrs | reject('search', ':') | list %}
+{% set ipv6_cidrs = trusted_cidrs | select('search', ':') | list %}
+destroy table inet k3s_bootstrap
+table inet k3s_bootstrap {
+{% if ipv4_cidrs %}
+  set api_trusted_ipv4 {
+    type ipv4_addr;
+    flags interval;
+    auto-merge;
+    elements = { {{ ipv4_cidrs | join(', ') }} };
+  }
+{% endif %}
+
+{% if ipv6_cidrs %}
+  set api_trusted_ipv6 {
+    type ipv6_addr;
+    flags interval;
+    auto-merge;
+    elements = { {{ ipv6_cidrs | join(', ') }} };
+  }
+{% endif %}
+
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname "lo" accept;
+{% if ipv4_cidrs %}
+    tcp dport { 2379, 2380, 6443 } ip saddr @api_trusted_ipv4 accept;
+{% endif %}
+{% if ipv6_cidrs %}
+    tcp dport { 2379, 2380, 6443 } ip6 saddr @api_trusted_ipv6 accept;
+{% endif %}
+    tcp dport { 2379, 2380, 6443 } drop;
+  }
+}

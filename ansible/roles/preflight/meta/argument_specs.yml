@@ -1,0 +1,51 @@
+---
+# Inputs of the role, checked by Ansible on role entry; see README.md for
+# what the role does. Render: ansible-doc -t role -r ansible/roles preflight
+argument_specs:
+  main:
+    short_description: Refuse an unsupported or unsafe node before anything changes
+    description: See README.md in this role.
+    options:
+      node_type:
+        description: What this node becomes; initial bootstraps the cluster (embedded etcd), server and agent join through head.
+        type: str
+        required: true
+        choices: [initial, server, agent]
+      head:
+        description: SSH coordinates of a node that already runs the cluster as a server. Required for server and agent, null for initial.
+        type: dict
+        options:
+          host:
+            description: Address of the head; the join address is host:6443.
+            type: str
+            required: true
+          port:
+            description: SSH port of the head.
+            type: int
+            default: 22
+          user:
+            description: Admin user on the head with passwordless sudo.
+            type: str
+            required: true
+      firewall_mode:
+        description: managed installs the isolated nftables gate on servers; off touches nothing and refuses an existing module firewall.
+        type: str
+        required: true
+        choices: [managed, 'off']
+      sysctls:
+        description: Caller sysctls (name to value); keys owned by k3s must keep the k3s value.
+        type: dict
+        required: true
+      k3s_version:
+        description: Exact k3s pin, for example v1.36.5+k3s1.
+        type: str
+        required: true
+      kernel_modules:
+        description: Kernel modules to load and persist besides br_netfilter and overlay.
+        type: list
+        elements: str
+        required: true
+      grow_root_filesystem:
+        description: Grow the root partition and its ext4 or xfs filesystem to fill the disk.
+        type: bool
+        required: true

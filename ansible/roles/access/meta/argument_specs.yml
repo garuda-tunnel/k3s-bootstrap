@@ -1,0 +1,17 @@
+---
+# Inputs of the role, checked by Ansible on role entry; see README.md for
+# what the role does. Render: ansible-doc -t role -r ansible/roles access
+argument_specs:
+  main:
+    short_description: Provision the admin user with keys and passwordless sudo
+    description: See README.md in this role.
+    options:
+      ssh_user:
+        description: Non-root admin user the module provisions and later connects as; never root.
+        type: str
+        required: true
+      authorized_keys:
+        description: Public keys authorized for ssh_user (added, other keys kept).
+        type: list
+        elements: str
+        required: true

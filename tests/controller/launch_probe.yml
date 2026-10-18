@@ -1,0 +1,15 @@
+---
+# Test helper: run molecule/shared/tasks/launch.yml against a fake child so
+# the test can read this playbook's own PLAY RECAP, as Molecule's idempotence
+# step does.
+- name: Launch a fake child
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Judge the child by its recap
+      ansible.builtin.include_tasks: "{{ probe_launch_tasks }}"
+      vars:
+        k3sb_launch_command: "{{ probe_command }}"
+        k3sb_launch_env: "{{ probe_env }}"
+        k3sb_launch_chdir: "{{ probe_dir }}"

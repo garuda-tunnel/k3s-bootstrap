@@ -1,0 +1,21 @@
+---
+- name: Authorize the controller key
+  ansible.builtin.import_playbook: ../shared/prepare.yml
+
+- name: Make the instance a first install that asks for a reboot
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Remember the boot the scenario starts on
+      ansible.builtin.copy:
+        src: /proc/sys/kernel/random/boot_id
+        remote_src: true
+        dest: /var/tmp/k3sb-prepare-boot-id
+        mode: '0644'
+
+    - name: Ask for a reboot the way a package upgrade does
+      ansible.builtin.copy:
+        content: "*** System restart required ***\n"
+        dest: /run/reboot-required
+        mode: '0644'

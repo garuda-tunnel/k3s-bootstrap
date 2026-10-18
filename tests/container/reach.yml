@@ -1,0 +1,21 @@
+---
+# Test helper: after the module playbook's inventory play, connect to the
+# registered node over SSH (the host-key test judges the exit code).
+- name: Register the inventory
+  ansible.builtin.import_playbook: ../../ansible/k3s-node.yml
+
+- name: Reach the registered node
+  hosts: k3s_node
+  gather_facts: false
+  tags: always
+  tasks:
+    - name: Use the connection the Inventory play registered
+      # The Host play's always-run pre-task already switched the node to
+      # ssh_user (a fact, which only another fact outranks); ssh_user only
+      # exists once access ran.
+      ansible.builtin.set_fact:
+        ansible_user: "{{ hostvars['localhost'].inventory_connection_user }}"
+
+    - name: Run a command over the connection
+      ansible.builtin.command: hostname
+      changed_when: false

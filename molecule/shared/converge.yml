@@ -1,0 +1,13 @@
+---
+# Converge the scenario's single instance with the real module playbook,
+# launched from the controller (see tasks/apply.yml).
+- name: Apply the module playbook to the instance
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [vars/module_vars.yml]
+  tasks:
+    - name: Apply the module playbook
+      ansible.builtin.include_tasks: tasks/apply.yml
+      vars:
+        k3sb_instance: "{{ groups['all'] | first }}"

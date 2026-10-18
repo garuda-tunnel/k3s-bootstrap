@@ -1,0 +1,57 @@
+---
+# First install of an `agent`: the head mints a bootstrap token whose TTL
+# covers this run (readiness_timeout plus 5 minutes) and the token goes to
+# the node's 0600 token file that config.yaml names. The role's `always`
+# deletes it on the head by id once the run ends, joined or not. A node
+# with the completion marker never runs this file; an agent that later needs
+# a new client certificate without a valid one (offline past expiry, or
+# certs rotated on the agent) rejoins by a re-apply after its marker is
+# removed (README). Every task that holds the token has no_log and no diff.
+- name: Mint a short-lived bootstrap token on the head
+  ansible.builtin.command:
+    argv:
+      - timeout
+      - "60"
+      - k3s
+      - token
+      - create
+      - --ttl
+      - "{{ hostvars['localhost'].inventory_readiness_seconds | int + 300 }}s"
+      - --description
+      - "k3s-bootstrap:{{ host }}"
+  delegate_to: head
+  become: true
+  changed_when: true
+  register: k3s_bootstrap_token
+  # Exit code only: the head's API can answer 503 for a while (etcd under
+  # load) although the head was Ready; at most 30 s more.
+  until: k3s_bootstrap_token.rc == 0
+  retries: 6
+  delay: 5
+  no_log: true
+
+- name: Keep the token id for its deletion
+  # The printed token is K10<CA hash>::<id>.<secret>.
+  ansible.builtin.set_fact:
+    k3s_bootstrap_token_id: "{{ (k3s_bootstrap_token.stdout | trim).split('::')[-1].split('.')[0] }}"
+  no_log: true
+
+- name: Require a well-formed token id
+  ansible.builtin.assert:
+    that: k3s_bootstrap_token_id is match('^[a-z0-9]{6}$')
+    fail_msg: The head printed no bootstrap token in the expected K10<hash>::<id>.<secret> form.
+
+- name: Write the join token file
+  ansible.builtin.copy:
+    content: "{{ k3s_bootstrap_token.stdout | trim }}\n"
+    dest: "{{ k3s_token_file }}"
+    owner: root
+    group: root
+    mode: '0600'
+  diff: false
+  no_log: true
+
+- name: Drop the token from play memory
+  ansible.builtin.set_fact:
+    k3s_bootstrap_token: null
+  no_log: true

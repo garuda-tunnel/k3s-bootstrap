@@ -1,0 +1,16 @@
+---
+# Run only the readiness play (plus the Inventory play) and record its
+# wall-clock seconds in k3sb_readiness_seconds. Inputs: k3sb_instance,
+# optional k3sb_apply_vars and k3sb_apply_may_fail.
+- name: Record the start of the readiness run
+  ansible.builtin.set_fact:
+    k3sb_readiness_started: "{{ now().timestamp() | int }}"
+
+- name: Run the readiness play
+  ansible.builtin.include_tasks: ../../shared/tasks/apply.yml
+  vars:
+    k3sb_apply_args: [--tags, readiness]
+
+- name: Record how long the readiness run took
+  ansible.builtin.set_fact:
+    k3sb_readiness_seconds: "{{ now().timestamp() | int - k3sb_readiness_started | int }}"

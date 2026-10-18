@@ -1,0 +1,25 @@
+---
+# One ephemeral controller key for the whole scenario, authorized on every
+# VM, so a node and its head are reached with the same private key path (the
+# module has a single ssh_private_key_file). Scenario prepare playbooks import
+# this first.
+- name: Create the controller key
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [vars/module_vars.yml]
+  tasks:
+    - name: Generate the key pair once per scenario run
+      ansible.builtin.command:
+        argv: [ssh-keygen, -q, -t, ed25519, -N, "", -C, k3s-bootstrap-molecule, -f, "{{ k3sb_controller_key }}"]
+        creates: "{{ k3sb_controller_key }}"
+
+- name: Authorize the controller key on every VM
+  hosts: all
+  gather_facts: false
+  vars_files: [vars/module_vars.yml]
+  tasks:
+    - name: Add the public key to the login user
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        key: "{{ lookup('ansible.builtin.file', k3sb_controller_key ~ '.pub') }}"

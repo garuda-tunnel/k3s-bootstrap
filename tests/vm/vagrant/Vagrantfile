@@ -1,0 +1,32 @@
+# Minimal stand VM for the module test tier: the fixture copies
+# this file verbatim into a per-stand directory (one Vagrant machine per
+# stand) and drives it with `vagrant up` / `vagrant destroy -f`. Per-stand
+# values arrive through the environment because the template is unmodified.
+# Only `vagrant up` needs them: manual cleanup (`vagrant destroy -f`,
+# `vagrant status`) must work from a fresh shell without the fixture env.
+MACHINE = ENV.fetch("K3SB_MACHINE_NAME", nil)
+PUBKEY = ENV.fetch("K3SB_PUBKEY", nil)
+if ARGV.include?("up") && (MACHINE.nil? || PUBKEY.nil?)
+  abort "K3SB_MACHINE_NAME and K3SB_PUBKEY are required for `vagrant up`"
+end
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "cloud-image/ubuntu-26.04"
+  config.vm.box_version = "20260927.0.0"
+  config.vm.hostname = MACHINE if MACHINE
+  # The fixture uploads everything through the module's provisioners.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  config.vm.provider :libvirt do |lv|
+    lv.memory = 2048
+    lv.cpus = 2
+    lv.graphics_type = "none"
+  end
+
+  # The module bootstraps through the box's sudo user (`vagrant`); this
+  # key is the module's ssh_private_key_file, authorized for the vagrant
+  # user here and for the module's ssh_user once the access tag has run.
+  config.vm.provision "shell", inline: <<-SHELL
+    grep -qF '#{PUBKEY}' /home/vagrant/.ssh/authorized_keys || echo '#{PUBKEY}' >> /home/vagrant/.ssh/authorized_keys
+  SHELL
+end

@@ -1,0 +1,49 @@
+---
+# Capture config, marker, CA, datastore, binary, installer witness, service
+# and data markers into the fact named by k3sb_snapshot_name. The configmap
+# proves the datastore was not reset; the CA hash that the cluster identity
+# survived; the datastore inode, binary and k3s-uninstall.sh mtimes that
+# nothing was reinstalled; ActiveEnterTimestamp that nothing was restarted.
+# Runs on the instance from a localhost play; input: k3sb_instance.
+- name: Take the safety snapshot
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  block:
+    - name: Inspect the config, CA, marker, datastore, binary and installer witness
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop:
+        - /etc/rancher/k3s/config.yaml
+        - /var/lib/rancher/k3s/server/tls/server-ca.crt
+        - /var/lib/k3s-bootstrap/installed
+        - /var/lib/rancher/k3s/server/db/etcd
+        - /usr/local/bin/k3s
+        - /usr/local/bin/k3s-uninstall.sh
+      register: k3sb_snapshot_files
+
+    - name: Read when k3s last became active
+      community.general.systemd_info:
+        unitname: [k3s.service]
+        extra_properties: [ActiveEnterTimestamp]
+      register: k3sb_snapshot_unit
+
+    - name: Read the safety marker
+      ansible.builtin.command:
+        argv: [k3s, kubectl, get, configmap, k3sb-safety-marker, -o, "jsonpath={.data.value}"]
+      changed_when: false
+      register: k3sb_snapshot_marker
+
+- name: Record the snapshot
+  vars:
+    k3sb_stats: "{{ k3sb_snapshot_files.results | map(attribute='stat') | list }}"
+  ansible.builtin.set_fact:
+    "{{ k3sb_snapshot_name }}":
+      config: "{{ k3sb_stats[0].checksum }}"
+      ca: "{{ k3sb_stats[1].checksum }}"
+      marker: "{{ k3sb_stats[2].checksum }}"
+      datastore_inode: "{{ k3sb_stats[3].inode }}"
+      binary_mtime: "{{ k3sb_stats[4].mtime }}"
+      installer_mtime: "{{ k3sb_stats[5].mtime }}"
+      active_since: "{{ k3sb_snapshot_unit.units['k3s.service'].activeentertimestamp }}"
+      safety_marker: "{{ k3sb_snapshot_marker.stdout }}"

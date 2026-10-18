@@ -1,0 +1,38 @@
+---
+# Apply the module with changed inputs and require a refusal by the expected
+# task that changed nothing. Runs in a localhost play of a scenario's verify.yml.
+# Inputs: k3sb_instance; k3sb_variant_vars (dict merged over the instance's
+# module variables); k3sb_reject_task (the failing task as Ansible prints it,
+# `role : Task name`; never the message text); optional k3sb_reject_item (the
+# loop item that failed). The scenario's tasks/snapshot.yml decides "nothing
+# changed".
+- name: Name the scenario's snapshot tasks
+  ansible.builtin.set_fact:
+    k3sb_scenario_snapshot: "{{ playbook_dir }}/tasks/snapshot.yml"
+
+- name: Snapshot before the refused run
+  ansible.builtin.include_tasks: "{{ k3sb_scenario_snapshot }}"
+  vars:
+    k3sb_snapshot_name: k3sb_reject_before
+
+- name: Apply with the changed variables
+  ansible.builtin.include_tasks: apply.yml
+  vars:
+    k3sb_apply_vars: "{{ k3sb_variant_vars }}"
+    k3sb_apply_may_fail: true
+
+- name: Snapshot after the refused run
+  ansible.builtin.include_tasks: "{{ k3sb_scenario_snapshot }}"
+  vars:
+    k3sb_snapshot_name: k3sb_reject_after
+
+- name: Assert the run was refused by the expected task and changed nothing
+  # Checked unconditionally: a run that unexpectedly succeeds fails here.
+  ansible.builtin.assert:
+    that:
+      - k3sb_run.rc != 0
+      - >-
+        k3sb_run.stdout is regex(
+          'TASK \[' ~ (k3sb_reject_task | regex_escape) ~ '\][^\n]*\n(?:(?!TASK \[)[\s\S])*?(?:fatal|failed): \[[^\]]+\]'
+          ~ ((' \(item=' ~ (k3sb_reject_item | regex_escape) ~ '\)') if k3sb_reject_item is defined else ''))
+      - k3sb_reject_after == k3sb_reject_before

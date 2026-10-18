@@ -1,0 +1,20 @@
+---
+# Module inputs every scenario instance starts from, as a caller of the
+# module would pass them. An instance overrides them in its `k3s_node`
+# hostvar (molecule.yml); `k3s_head` names the instance it joins through.
+# Connection data (host, port, bootstrap user) comes from the instance; the
+# key is the one controller key of the run (shared/prepare.yml).
+k3sb_controller_key: "{{ lookup('ansible.builtin.env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/controller_key"
+k3sb_defaults:
+  node_type: initial
+  ssh_user: vagrant
+  kernel_modules: [br_netfilter]
+  sysctls: {}
+  k3s_version: "{{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'MOLECULE_PROJECT_DIRECTORY') ~ '/tests/k3s-version.txt') | trim }}"
+  k3s_config: {}
+  firewall_mode: managed
+  api_trusted_cidrs: [192.168.122.1/32]
+  cluster_cidrs: [10.42.0.0/16, 10.43.0.0/16]
+  grow_root_filesystem: false
+  connection_timeout: 5m
+  readiness_timeout: 5m

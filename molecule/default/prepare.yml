@@ -1,0 +1,19 @@
+---
+- name: Authorize the controller key
+  ansible.builtin.import_playbook: ../shared/prepare.yml
+
+- name: Create the SSH user with a primary group distinct from its name
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Create the admins group
+      become: true
+      ansible.builtin.group:
+        name: admins
+
+    - name: Create the ops user in it
+      become: true
+      ansible.builtin.user:
+        name: ops
+        group: admins
+        create_home: true

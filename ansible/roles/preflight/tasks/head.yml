@@ -1,0 +1,80 @@
+---
+# Pre-checks that need the cluster head (node types server and agent). The
+# head is reached over SSH with the module key, so the identity check is
+# authenticated instead of trusting an unauthenticated HTTP probe. Nothing
+# here changes a host.
+
+- name: Read the cluster CA certificate of the head
+  # Public data, no no_log. Missing file and unreachable head are told apart
+  # below: an unreachable head must not read as "not a server".
+  ansible.builtin.slurp:
+    src: /var/lib/rancher/k3s/server/tls/server-ca.crt
+  delegate_to: head
+  become: true
+  timeout: 30
+  ignore_unreachable: true
+  failed_when: false
+  register: preflight_head_ca
+
+- name: Require a reachable head
+  ansible.builtin.assert:
+    that: preflight_head_ca is not unreachable
+    fail_msg: >-
+      cannot verify cluster identity: the head {{ head.host }}:{{ head.port | default(22) }}
+      is unreachable over SSH as {{ head.user }}: {{ preflight_head_ca.msg | default('') }}
+
+- name: Check for the server token file of the head
+  # Only metadata is read, never content or hash. k3s may symlink its token file.
+  ansible.builtin.stat:
+    path: /var/lib/rancher/k3s/server/token
+    follow: true
+    get_checksum: false
+    get_mime: false
+  delegate_to: head
+  become: true
+  timeout: 30
+  register: preflight_head_token
+
+- name: Require an initialised k3s server as the head
+  # An agent has neither file, so this also refuses an agent as head.
+  ansible.builtin.assert:
+    that:
+      - preflight_head_ca.content is defined
+      - preflight_head_token.stat.exists
+      - preflight_head_token.stat.isreg
+      - preflight_head_token.stat.size > 0
+    fail_msg: >-
+      The head {{ head.host }} is not an initialised k3s server (cluster CA
+      certificate missing or server token is not a non-empty regular file);
+      it must be an initial or server node of a running cluster.
+
+- name: Check for an existing cluster CA certificate
+  ansible.builtin.stat:
+    path: >-
+      {{ '/var/lib/rancher/k3s/agent/server-ca.crt' if node_type == 'agent'
+         else '/var/lib/rancher/k3s/server/tls/server-ca.crt' }}
+    checksum_algorithm: sha256
+  register: preflight_k3s_ca_cert
+
+- name: Fail closed when the cluster identity cannot be verified
+  # An installed node without its CA certificate cannot be compared with the
+  # head; proceeding would trust data of unknown provenance.
+  ansible.builtin.assert:
+    that: preflight_k3s_ca_cert.stat.exists
+    fail_msg: >-
+      Cannot verify the cluster identity of the existing
+      {{ preflight_k3s_installed_class }} installation: the expected CA
+      certificate is missing, so this module refuses to converge.
+  when: preflight_k3s_installed_class != 'none'
+
+- name: Reject a head from a different cluster
+  # A node that holds a cluster CA (installed, or an unfinished join that got
+  # that far) must keep joining the same cluster: the head's CA and the local
+  # CA certificate must be the same bytes. A first join has no local CA; k3s
+  # checks the token's CA hash itself.
+  ansible.builtin.assert:
+    that: (preflight_head_ca.content | b64decode | hash('sha256')) == preflight_k3s_ca_cert.stat.checksum
+    fail_msg: >-
+      The head {{ head.host }} belongs to a different cluster than the one
+      this node already belongs to.
+  when: preflight_k3s_ca_cert.stat.exists

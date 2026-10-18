@@ -1,0 +1,13 @@
+[Unit]
+Description=Isolated k3s bootstrap firewall
+Before=k3s.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f {{ k3s_firewall_ruleset }}
+ExecReload=/usr/sbin/nft -f {{ k3s_firewall_ruleset }}
+ExecStop=/usr/sbin/nft destroy table inet k3s_bootstrap
+
+[Install]
+WantedBy=multi-user.target

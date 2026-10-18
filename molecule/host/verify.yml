@@ -1,0 +1,141 @@
+---
+- name: Verify the converged host state and the first-install reboot
+  hosts: all
+  gather_facts: false
+  become: true
+  vars_files: [../shared/vars/module_vars.yml]
+  vars:
+    k3sb_modules_file: /etc/modules-load.d/k3s-bootstrap.conf
+    k3sb_sysctl_file: /etc/sysctl.d/90-k3s-bootstrap.conf
+    k3sb_builtin_module: af_packet
+  tasks:
+    - name: Read the boot id prepare recorded
+      ansible.builtin.slurp:
+        src: /var/tmp/k3sb-prepare-boot-id
+      register: k3sb_boot_prepared
+
+    - name: Read the current boot id
+      ansible.builtin.slurp:
+        src: /proc/sys/kernel/random/boot_id
+      register: k3sb_boot_now
+
+    - name: Look for the host reboot request
+      ansible.builtin.stat:
+        path: /run/reboot-required
+        get_checksum: false
+      register: k3sb_request
+
+    - name: Assert converge rebooted the host and the reboot cleared the request
+      # The idempotence step ran a second converge that reported no change, so
+      # the host rebooted once, in the first converge.
+      ansible.builtin.assert:
+        that:
+          - k3sb_boot_now.content != k3sb_boot_prepared.content
+          - not k3sb_request.stat.exists
+
+    - name: Assert modules and sysctls are in place after the converges
+      # The idempotence converge ran after the first-install reboot and
+      # reapplies both, so this checks the converged end state, not
+      # persistence; the explicit reboot at the end of this play does that.
+      ansible.builtin.include_tasks: tasks/state.yml
+
+    - name: Inspect the k3s binary
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+        get_checksum: false
+      register: k3sb_binary
+
+    - name: Read the kernel statistics
+      ansible.builtin.slurp:
+        src: /proc/stat
+      register: k3sb_proc_stat
+
+    - name: Assert k3s was installed after the reboot, not before it
+      # The first install reboots before k3s: the k3s binary is newer than
+      # the current boot (`btime`, the boot time in epoch seconds).
+      ansible.builtin.assert:
+        that: >-
+          k3sb_binary.stat.mtime | int
+          > ((k3sb_proc_stat.content | b64decode).splitlines() | select('match', 'btime ') | first | split | last | int)
+
+    - name: Restart k3s
+      ansible.builtin.systemd_service:
+        name: k3s
+        state: restarted
+
+    - name: Wait for k3s to be Ready again
+      ansible.builtin.command: k3s kubectl wait --for=condition=Ready node --all --timeout=180s
+      changed_when: false
+
+    - name: Assert modules and sysctls survive the k3s restart
+      # k3s rewrites the bridge sysctls at start; the module's values must
+      # be the ones it leaves.
+      ansible.builtin.include_tasks: tasks/state.yml
+
+    - name: Reboot the host with no module run before the check
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+
+    - name: Assert modules and sysctls survive the reboot
+      # Nothing but the persisted files can restore them now: the module is
+      # not run, and k3s only owns the bridge sysctls.
+      ansible.builtin.include_tasks: tasks/state.yml
+
+    - name: Wait for k3s to be Ready after the reboot
+      ansible.builtin.command: k3s kubectl wait --for=condition=Ready node --all --timeout=180s
+      changed_when: false
+      retries: 12
+      delay: 10
+      register: k3sb_ready
+      until: k3sb_ready.rc == 0
+
+- name: Verify refused and day-2 applies
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../shared/vars/module_vars.yml]
+  vars:
+    k3sb_instance: "{{ groups['all'] | first }}"
+  tasks:
+    - name: Check a valid module is available and not loaded yet
+      # tcp_bic goes before the nonexistent module in the refused run below:
+      # a loop that loads module by module would leave it loaded.
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      block:
+        - name: Resolve tcp_bic without loading it
+          ansible.builtin.command:
+            argv: [modinfo, -n, tcp_bic]
+          changed_when: false
+
+        - name: Read the loaded modules
+          ansible.builtin.slurp:
+            src: /proc/modules
+          register: k3sb_loaded_modules
+
+        - name: Assert tcp_bic is not loaded
+          ansible.builtin.assert:
+            that: >-
+              'tcp_bic' not in ((k3sb_loaded_modules.content | b64decode).splitlines()
+              | map('split') | map('first') | list)
+
+    - name: Refuse a requested kernel module that does not exist, loading nothing
+      ansible.builtin.include_tasks: ../shared/tasks/reject.yml
+      vars:
+        # vm.max_map_count also moves, so a run that got past the host role
+        # would visibly change the snapshot.
+        k3sb_variant_vars:
+          kernel_modules: [br_netfilter, tcp_bbr, af_packet, tcp_bic, k3sb_no_such_module]
+          sysctls: {vm.max_map_count: '131072'}
+        k3sb_reject_task: 'preflight : Check that every required kernel module can be loaded'
+        k3sb_reject_item: k3sb_no_such_module
+
+    - name: Assert the refused run kept the converged sysctls
+      ansible.builtin.assert:
+        that: k3sb_reject_after.sysctls == ['262144', '1', '1']
+
+    - name: Do not reboot an installed node on day 2
+      ansible.builtin.include_tasks: tasks/day2.yml
+
+    - name: Grow the root filesystem without data loss
+      ansible.builtin.include_tasks: tasks/rootfs.yml
