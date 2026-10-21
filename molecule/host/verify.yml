@@ -39,6 +39,14 @@
       # persistence; the explicit reboot at the end of this play does that.
       ansible.builtin.include_tasks: tasks/state.yml
 
+    - name: Gather installed packages
+      ansible.builtin.package_facts:
+        manager: apt
+
+    - name: Assert the extra package jq is installed
+      ansible.builtin.assert:
+        that: "'jq' in ansible_facts.packages"
+
     - name: Inspect the k3s binary
       ansible.builtin.stat:
         path: /usr/local/bin/k3s

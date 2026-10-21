@@ -14,6 +14,7 @@ locals {
     authorized_keys      = var.authorized_keys
     sysctls              = var.sysctls
     kernel_modules       = var.kernel_modules
+    extra_packages       = var.extra_packages
     k3s_version          = var.k3s_version
     k3s_config           = var.k3s_config
     firewall_mode        = var.firewall_mode

@@ -292,6 +292,40 @@ run "rejects_unparsable_connection_timeout" {
   expect_failures = [var.connection_timeout]
 }
 
+# --- extra_packages ------------------------------------------------------
+
+run "rejects_invalid_extra_package_name" {
+  command = plan
+
+  variables {
+    extra_packages = ["jq", "foo bar"]
+  }
+
+  expect_failures = [var.extra_packages]
+}
+
+run "accepts_default_extra_packages_as_empty_list" {
+  command = plan
+
+  assert {
+    condition     = jsonencode(local.run_vars.extra_packages) == "[]"
+    error_message = "extra_packages must default to an empty list that reaches the playbook vars."
+  }
+}
+
+run "passes_extra_packages_to_playbook" {
+  command = plan
+
+  variables {
+    extra_packages = ["jq", "qemu-guest-agent", "libstdc++6", "python3.14"]
+  }
+
+  assert {
+    condition     = local.run_vars.extra_packages == tolist(var.extra_packages)
+    error_message = "Valid package names must reach the playbook unchanged."
+  }
+}
+
 # --- firewall and CIDRs ------------------------------------------------
 
 run "rejects_unknown_firewall_mode" {

@@ -1,15 +1,21 @@
 # Role `host`
 
-Loads and persists the kernel modules (`br_netfilter`, `overlay` and
-`kernel_modules`), applies the k3s-owned and caller sysctls
-(`/etc/sysctl.d/90-k3s-bootstrap.conf`), optionally grows the root partition
-and filesystem, and requests the first-install reboot.
+Installs the caller's extra packages (`extra_packages`, apt `state:
+present`; an empty list installs nothing; listing `qemu-guest-agent`
+also enables and starts its service), loads and persists the kernel
+modules (`br_netfilter`, `overlay` and `kernel_modules`), applies the
+k3s-owned and caller sysctls (`/etc/sysctl.d/90-k3s-bootstrap.conf`),
+optionally grows the root partition and filesystem, and requests the
+first-install reboot.
 
 ## Invariants
 
 - The role only changes the host: the module list and the root growth
   layout are checked by `preflight` before any change of the run; a missing
   k3s-owned sysctl fails in `ansible.posix.sysctl` itself.
+- Extra packages are installed `state: present` and never removed or
+  upgraded by the module; the package names are validated at plan time
+  (`^[a-z0-9][a-z0-9+.-]+$`).
 - Root growth: `growpart` (exit code 1 means already full), then
   `resize2fs` or `xfs_growfs`; `changed` is decided by the sizes before and
   after, never by tool output. Only ext4 or xfs on a direct partition.

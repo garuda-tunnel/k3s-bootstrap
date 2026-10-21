@@ -37,6 +37,7 @@ NODE_VARS: dict[str, Any] = {
     ],
     "sysctls": {},
     "kernel_modules": [],
+    "extra_packages": [],
     "k3s_version": "v1.33.0+k3s1",
     "api_trusted_cidrs": [],
     "cluster_cidrs": [],

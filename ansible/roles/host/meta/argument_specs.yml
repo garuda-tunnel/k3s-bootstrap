@@ -3,12 +3,17 @@
 # what the role does. Render: ansible-doc -t role -r ansible/roles host
 argument_specs:
   main:
-    short_description: Kernel modules, sysctls, root filesystem growth and the first-install reboot
+    short_description: Extra packages, kernel modules, sysctls, root filesystem growth and the first-install reboot
     description: See README.md in this role.
     options:
       sysctls:
         description: Caller sysctls (name to value); keys owned by k3s must keep the k3s value.
         type: dict
+        required: true
+      extra_packages:
+        description: Extra apt packages to install (state present); listing qemu-guest-agent also enables and starts its service.
+        type: list
+        elements: str
         required: true
       grow_root_filesystem:
         description: Grow the root partition and its ext4 or xfs filesystem to fill the disk.

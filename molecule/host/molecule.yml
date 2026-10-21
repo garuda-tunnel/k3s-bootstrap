@@ -32,6 +32,7 @@ provisioner:
           # /sys/module entry, so only the built-in check can accept it.
           kernel_modules: [br_netfilter, tcp_bbr, af_packet]
           sysctls: {vm.max_map_count: '262144'}
+          extra_packages: [jq]
   playbooks:
     prepare: prepare.yml
     converge: ../shared/converge.yml

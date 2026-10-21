@@ -135,6 +135,18 @@ variable "kernel_modules" {
   default     = []
 }
 
+variable "extra_packages" {
+  description = "Additional apt packages to install on the host, for example qemu-guest-agent. Listing qemu-guest-agent also enables and starts its service."
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition     = alltrue([for name in var.extra_packages : can(regex("^[a-z0-9][a-z0-9+.-]+$", name))])
+    error_message = "Every extra_packages entry must be an apt package name matching ^[a-z0-9][a-z0-9+.-]+$, for example jq or qemu-guest-agent."
+  }
+}
+
 variable "k3s_version" {
   description = "Exact k3s version pin, for example v1.33.0+k3s1. Never a floating tag."
   type        = string

@@ -33,6 +33,24 @@
     reload: true
   loop: "{{ sysctls | dict2items }}"
 
+- name: Install extra packages
+  # An empty list (the default) skips the task, so a run without extra
+  # packages does no apt call and no cache refresh.
+  when: extra_packages | length > 0
+  ansible.builtin.apt:
+    name: "{{ extra_packages }}"
+    state: present
+    update_cache: true
+
+- name: Enable and start the qemu-guest-agent service
+  # The caller listed the agent, so the module guarantees its service, not
+  # only its package.
+  when: "'qemu-guest-agent' in extra_packages"
+  ansible.builtin.systemd_service:
+    name: qemu-guest-agent
+    enabled: true
+    state: started
+
 # Preflight verified the layout and named preflight_root, preflight_root_disk
 # and preflight_root_partn before any change.
 - name: Grow the root partition and filesystem

@@ -25,7 +25,7 @@ run "no_sensitive_variable" {
     condition = !anytrue([for value in [
       var.node_type, var.host, var.port, var.head, var.host_key_check, var.host_generation,
       var.bootstrap_user, var.ssh_user, var.ssh_private_key_file, var.authorized_keys,
-      var.sysctls, var.kernel_modules, var.k3s_version, var.k3s_config, var.firewall_mode,
+      var.sysctls, var.kernel_modules, var.extra_packages, var.k3s_version, var.k3s_config, var.firewall_mode,
       var.api_trusted_cidrs, var.cluster_cidrs, var.grow_root_filesystem,
       var.connection_timeout, var.readiness_timeout,
     ] : issensitive(value)])
@@ -39,7 +39,7 @@ run "run_vars_are_node_settings_only" {
   assert {
     condition = sort(keys(local.run_vars)) == sort([
       "node_type", "host", "port", "head", "host_key_check", "bootstrap_user", "ssh_user",
-      "ssh_private_key_file", "authorized_keys", "sysctls", "kernel_modules", "k3s_version",
+      "ssh_private_key_file", "authorized_keys", "sysctls", "kernel_modules", "extra_packages", "k3s_version",
       "k3s_config", "firewall_mode", "api_trusted_cidrs", "cluster_cidrs",
       "grow_root_filesystem", "connection_timeout", "readiness_timeout",
     ])

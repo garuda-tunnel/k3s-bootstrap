@@ -7,6 +7,11 @@
   gather_facts: false
   become: true
   tasks:
+    - name: Remove jq so converge must install the extra package
+      ansible.builtin.apt:
+        name: jq
+        state: absent
+
     - name: Remember the boot the scenario starts on
       ansible.builtin.copy:
         src: /proc/sys/kernel/random/boot_id

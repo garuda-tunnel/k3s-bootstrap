@@ -83,6 +83,7 @@ def node_vars(node: SystemdHost) -> dict[str, Any]:
         "authorized_keys": [node.key_path.with_suffix(".pub").read_text().strip()],
         "sysctls": {},
         "kernel_modules": [],
+        "extra_packages": [],
         "k3s_version": "v1.33.0+k3s1",
         "api_trusted_cidrs": [],
         "cluster_cidrs": [],

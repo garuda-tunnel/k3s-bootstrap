@@ -10,6 +10,7 @@ k3sb_defaults:
   ssh_user: vagrant
   kernel_modules: [br_netfilter]
   sysctls: {}
+  extra_packages: []
   k3s_version: "{{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'MOLECULE_PROJECT_DIRECTORY') ~ '/tests/k3s-version.txt') | trim }}"
   k3s_config: {}
   firewall_mode: managed

@@ -153,6 +153,10 @@ rejects module-owned keys (`token`, `token-file`, `agent-token`,
 its data safety (`data-dir`, `datastore-endpoint`, `cluster-reset`,
 `cluster-reset-restore-path`).
 
+| Optional input | Type | Default | Description |
+|---|---|---|---|
+| `extra_packages` | `list(string)` | `[]` | Additional apt packages to install (`state: present`, never removed by the module). Each name must match `^[a-z0-9][a-z0-9+.-]+$`. Listing `qemu-guest-agent` also enables and starts its service. |
+
 Outputs, all null on agents and available once the node is ready: `head`
 (this node's SSH coordinates, for `head = module.<name>.head`),
 `kubeconfig_path` (`/etc/rancher/k3s/k3s.yaml`, readable by `ssh_user`'s
