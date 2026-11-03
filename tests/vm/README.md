@@ -1,8 +1,8 @@
 # VM test tier (Vagrant/libvirt)
 
 This manual tier tests the OpenTofu module itself: each test drives real
-`tofu apply` runs against Ubuntu 26.04 VMs that Vagrant manages
-(`tests/vm/vagrant/Vagrantfile`, vagrant-libvirt provider, one directory
+`tofu apply` runs against Vagrant-managed VMs (Ubuntu 26.04 or Debian 13;
+`tests/vm/vagrant/Vagrantfile`, vagrant-libvirt provider, one directory
 per stand). Role behaviour lives in the Molecule scenarios; this tier is
 opt-in, serial, and never runs in CI.
 
@@ -29,8 +29,14 @@ and `phases.tftest.hcl` (state).
 ## Prerequisites
 
 - Packages: `qemu-system-x86`, `libvirt-daemon-system`; Vagrant with the
-  `vagrant-libvirt` plugin and the box
-  `cloud-image/ubuntu-26.04` (`20260927.0.0`) imported.
+  `vagrant-libvirt` plugin and one of the boxes below imported. The
+  Vagrantfile reads `K3SB_BOX` / `K3SB_BOX_VERSION` (same variables as the
+  Molecule scenarios; export both to run Debian stands).
+
+  | Host | `K3SB_BOX` | `K3SB_BOX_VERSION` |
+  |---|---|---|
+  | Ubuntu 26.04 (default) | `cloud-image/ubuntu-26.04` | `20260927.0.0` |
+  | Debian 13 | `cloud-image/debian-13` | `20260914.2601.0` |
 - Your user in the `libvirt` group (`sudo usermod -aG libvirt $USER`).
   A session opened before joining the group does not carry it yet: run
   pytest and molecule through `/usr/bin/sg libvirt -c '<cmd>'` (the full

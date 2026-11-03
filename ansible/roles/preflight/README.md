@@ -5,7 +5,10 @@ itself changes nothing.
 
 ## Invariants
 
-- Ubuntu 26.04 with systemd; no caller or foreign sysctl that conflicts with
+- A supported host (`vars/main.yml`: Ubuntu 26.04 or Debian 13, matched by
+  `ansible_distribution` and `ansible_distribution_release` codename, so
+  point releases stay accepted) with systemd; no caller or foreign sysctl
+  that conflicts with
   the k3s-owned bridge sysctls; with `firewall_mode: managed` no enabled ufw
   (config or loaded chains, decided by file content and an exit code, never
   by `ufw status` text) and no running firewalld; with `off` no existing

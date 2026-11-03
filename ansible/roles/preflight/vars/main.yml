@@ -1,0 +1,10 @@
+---
+# The only distribution knowledge of the module: one data-driven check in
+# this role's "Verify the supported host" task. Matching the release
+# codename (not the version) keeps point releases (13.1, 13.2) accepted
+# and refuses everything else; every role after preflight is common code
+# because both distros use apt, nftables, systemd and kmod under the same
+# package names. `name` builds the operator-facing refusal message.
+preflight_supported_hosts:
+  - {distribution: Ubuntu, release: resolute, name: Ubuntu 26.04}
+  - {distribution: Debian, release: trixie, name: Debian 13}

@@ -20,7 +20,9 @@ first-install reboot.
   `resize2fs` or `xfs_growfs`; `changed` is decided by the sizes before and
   after, never by tool output. Only ext4 or xfs on a direct partition.
 - Reboot: only when `/run/reboot-required` exists and the node is
-  pristine (`preflight_k3s_pristine`). The handler `reboot required` runs
+  pristine (`preflight_k3s_pristine`). Ubuntu writes that file when an
+  update needs a restart; stock Debian does not, so on Debian it appears
+  only if another component creates it. The handler `reboot required` runs
   `ansible.builtin.reboot` bounded by `connection_timeout` (the request lives
   on tmpfs, so the reboot clears it); the Host play flushes it before k3s is
   installed. An installed, adopted or partly installed node is never

@@ -1,5 +1,21 @@
 ---
 # Inputs are checked on role entry (meta/argument_specs.yml) and by the inventory role.
+- name: Verify the supported host
+  # The supported-host table (vars/main.yml) is the single distribution
+  # fork of the module; no role after this task branches on the distro.
+  ansible.builtin.assert:
+    that:
+      - >-
+        preflight_supported_hosts
+        | selectattr('distribution', 'equalto', ansible_distribution)
+        | selectattr('release', 'equalto', ansible_distribution_release)
+        | list | length > 0
+      - ansible_service_mgr == 'systemd'
+    fail_msg: >-
+      Bootstrap requires
+      {{ preflight_supported_hosts | map(attribute='name') | join(' or ') }}
+      with systemd.
+
 - name: Check whether the isolated firewall unit file exists
   ansible.builtin.stat:
     path: "{{ k3s_firewall_unit }}"
@@ -60,15 +76,6 @@
       {{ k3s_firewall_unit }} {{ k3s_firewall_ruleset }};
       systemctl daemon-reload before retrying.
   when: firewall_mode == 'off'
-
-- name: Verify the supported host
-  ansible.builtin.assert:
-    that:
-      - ansible_distribution == 'Ubuntu'
-      - ansible_distribution_version == '26.04'
-      - ansible_service_mgr == 'systemd'
-    fail_msg: >-
-      Bootstrap requires Ubuntu 26.04 with systemd.
 
 - name: Reject caller sysctls that conflict with k3s
   ansible.builtin.assert:
@@ -155,7 +162,7 @@
   # systemd-sysctl applies the files in file-name order and the last value
   # wins: a file named after ours (99-*.conf, sysctl.conf) would silently
   # replace a caller value on the next boot, while one named before ours is
-  # overridden by it (Ubuntu's own 10-*.conf defaults).
+  # overridden by it (the distribution's own 10-*.conf defaults).
   ansible.builtin.assert:
     that: >-
       (item.0.content | b64decode) is not regex(

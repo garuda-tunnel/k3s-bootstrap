@@ -10,7 +10,7 @@
 # therefore proves the access/SSH phases only; k3s itself is proven on
 # real VMs by the molecule scenarios (molecule/). Documented exception
 # (AGENTS.md) to the no-environment-forks rule: no supported host of this
-# module (Ubuntu 26.04 VM) is ever a Docker container.
+# module (an Ubuntu 26.04 or Debian 13 VM) is ever a Docker container.
 - name: Converge k3s
   when: ansible_virtualization_type != 'docker'
   block:

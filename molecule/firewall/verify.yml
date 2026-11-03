@@ -165,6 +165,15 @@
 
     - name: Refuse the managed firewall while ufw is enabled
       block:
+        - name: Install ufw
+          # No-op where the image ships ufw; the Debian cloud box does not.
+          become: true
+          delegate_to: "{{ k3sb_instance }}"
+          ansible.builtin.apt:
+            name: ufw
+            state: present
+            update_cache: true
+
         - name: Enable ufw with SSH allowed
           become: true
           delegate_to: "{{ k3sb_instance }}"

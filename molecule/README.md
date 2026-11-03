@@ -1,6 +1,7 @@
 # Molecule scenarios
 
-Role-level tests on real Ubuntu 26.04 VMs (Vagrant over libvirt). Every
+Role-level tests on real VMs (Ubuntu 26.04 or Debian 13; Vagrant over
+libvirt). Every
 scenario launches `ansible/k3s-node.yml` from the controller with the
 module's own command and environment (`shared/tasks/apply.yml`, kept equal
 to `main.tf` by `tests/controller/test_launch_parity.py`), so the roles are
@@ -33,8 +34,15 @@ the VM scenarios do not add a separate runtime case. The `cluster-cidr`/`service
 
 - libvirt (`qemu-system-x86`, `libvirt-daemon-system`) with `/dev/kvm`
   and the `default` libvirt network active.
-- Vagrant 2.4.9 with the `vagrant-libvirt` plugin 0.12.2 and the box
-  `cloud-image/ubuntu-26.04` 20260927.0.0 (the scenarios pin this version).
+- Vagrant 2.4.9 with the `vagrant-libvirt` plugin 0.12.2 and one of the
+  boxes below imported. Every scenario reads the box and its pin from
+  `K3SB_BOX` / `K3SB_BOX_VERSION` (defaults in `molecule/*/molecule.yml`,
+  same variables as `tests/vm`):
+
+  | Host | `K3SB_BOX` | `K3SB_BOX_VERSION` |
+  |---|---|---|
+  | Ubuntu 26.04 (default) | `cloud-image/ubuntu-26.04` | `20260927.0.0` |
+  | Debian 13 | `cloud-image/debian-13` | `20260914.2601.0` |
 - Your user in the `libvirt` group. A session opened before joining it
   does not carry the group yet, so run every command through
   `/usr/bin/sg libvirt -c '...'` (the full path; bare `sg` may be shadowed).
@@ -44,6 +52,8 @@ the VM scenarios do not add a separate runtime case. The `cluster-cidr`/`service
 - An activated venv with molecule and Ansible installed:
   `uv venv && uv pip install -r tests/requirements.txt`, then
   `source .venv/bin/activate` inside the `sg` command.
+- The `community.vagrant` collection, which the molecule-plugins Vagrant
+  driver calls: `ansible-galaxy collection install community.vagrant:1.0.1`.
 
 ## Inner loop
 

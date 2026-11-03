@@ -3,7 +3,7 @@
 Generic OpenTofu module that prepares **one** k3s node over SSH: a hardened
 host plus k3s as an `initial` node (the first server, embedded etcd), a
 `server` that joins it, or an `agent`. No cloud provider: the host is any
-reachable Ubuntu 26.04 LTS machine.
+reachable Ubuntu 26.04 LTS or Debian 13 machine.
 
 ## How it works
 
@@ -23,6 +23,8 @@ k3s, and a bounded readiness check. Nothing is copied to or installed on
 the node for the run. On a **first install** only, if the host asks for a
 reboot (`/run/reboot-required`), it reboots with `ansible.builtin.reboot`
 before k3s is installed; an installed or adopted node is never rebooted.
+Ubuntu writes that file when an update needs a restart; stock Debian does
+not, so on Debian the reboot fires only if something else creates the file.
 
 A `server` or `agent` joins through its `head`, a node that already runs
 the cluster. The playbook reads the join data from the head over SSH,
@@ -130,7 +132,8 @@ module "agent" {
 ## Refusals
 
 Preflight refuses, before changing anything: a host other than Ubuntu
-26.04 with systemd; an existing SQLite datastore (the module is etcd only
+26.04 or Debian 13 with systemd; an existing SQLite datastore (the module
+is etcd only
 and never converts; migration is out of scope); a k3s layout it cannot see
 (custom `data-dir` or `datastore-endpoint` in units, environment or k3s
 config files, or a running k3s without recognisable data); a change of
@@ -183,4 +186,4 @@ The molecule and VM tiers are manual, never in CI, and run through
 
 - OpenTofu >= 1.9.0.
 - Controller: `uv`, `ssh`.
-- Target host: Ubuntu 26.04 LTS with systemd and Python 3.
+- Target host: Ubuntu 26.04 LTS or Debian 13, with systemd and Python 3.

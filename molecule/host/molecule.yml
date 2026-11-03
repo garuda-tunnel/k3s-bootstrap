@@ -7,8 +7,8 @@ driver:
   provider: {name: libvirt}
 platforms:
   - name: k3sb-molecule-host
-    box: cloud-image/ubuntu-26.04
-    box_version: 20260927.0.0
+    box: ${K3SB_BOX:-cloud-image/ubuntu-26.04}
+    box_version: ${K3SB_BOX_VERSION:-20260927.0.0}
     memory: 2048
     cpus: 2
     config_options: {synced_folder: false, vm.box_check_update: false}
@@ -28,7 +28,7 @@ provisioner:
           firewall_mode: 'off'
           # tcp_bbr is not loaded by k3s or the base image, so seeing it
           # loaded after a reboot can only come from the persisted list.
-          # af_packet is built into the Ubuntu kernel and has no
+          # af_packet is built into the distribution kernel and has no
           # /sys/module entry, so only the built-in check can accept it.
           kernel_modules: [br_netfilter, tcp_bbr, af_packet]
           sysctls: {vm.max_map_count: '262144'}

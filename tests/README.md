@@ -33,7 +33,9 @@ and both harnesses, the Molecule launch judge, and `run_hash`. Runs in CI:
 ## Container tier (`container/`)
 
 pytest is the controller: it runs `ansible/k3s-node.yml` with the module's
-command against `ubuntu:26.04` systemd containers reached over SSH
+command against systemd containers of every supported base image
+(`K3SB_CONTAINER_IMAGE`, default `ubuntu:26.04`; the CI matrix also runs
+`debian:13`) reached over SSH
 (`test_preflight`, `test_access`, `test_ssh_hardening`, `test_host`), and a real
 `tofu apply`/re-apply of the module (`test_module_apply`). The inputs the
 controller-side `Inventory` play refuses are tested in the controller tier, not
@@ -86,7 +88,8 @@ Role behaviour on real Vagrant/libvirt VMs, five scenarios (`default`,
 
 ## VM tier (`vm/`)
 
-pytest against real provisioned Ubuntu 26.04 VMs; module-level contracts
+pytest against real provisioned VMs (Ubuntu 26.04 or Debian 13, see
+`tests/vm/README.md`); module-level contracts
 that each drive `tofu apply`/`destroy` (a bootstrapped node and its targeted
 destroy, the parallel cluster composition, an interrupted agent join). Manual
 only, never in CI. Prerequisites and the command are in `tests/vm/README.md`:

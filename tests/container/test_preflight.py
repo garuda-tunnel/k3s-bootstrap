@@ -88,20 +88,23 @@ def head_state(head: SystemdHost, ca: str | None, token: bool) -> AbstractContex
 
 
 def test_rejects_unsupported_os(systemd_host: SystemdHost) -> None:
-    """Verify preflight rejects an unsupported release before any change.
+    """Verify preflight rejects a host release no supported entry uses, before any change.
 
-    Validates: the supported-host assert gates every later play.
+    Validates: the supported-host assert (the only distribution check, driven
+        by the table in the role's ``vars/main.yml``) gates every later play.
     Code: ansible/roles/preflight/tasks/main.yml ("Verify the supported host")
 
-    Method: override ``ansible_distribution_version`` to 24.04 and run preflight.
+    Method: override ``ansible_distribution_release`` to a codename absent
+    from the table (``noble``), so the refusal fires on any base image the
+    tier runs on.
     """
     result = run_playbook(
         systemd_host,
         playbook_vars(),
-        extra_args=("--tags", "preflight", "-e", "ansible_distribution_version=24.04"),
+        extra_args=("--tags", "preflight", "-e", "ansible_distribution_release=noble"),
     )
 
-    assert_refused(result, "Bootstrap requires Ubuntu 26.04")
+    assert_refused(result, "Bootstrap requires Ubuntu 26.04 or Debian 13 with systemd.")
 
 
 @pytest.mark.parametrize(

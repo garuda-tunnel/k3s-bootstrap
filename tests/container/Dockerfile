@@ -1,9 +1,11 @@
-FROM ubuntu:26.04
+ARG BASE_IMAGE=ubuntu:26.04
+FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Test fixture image: mirrors the module's supported host (Ubuntu 26.04
-# LTS) with systemd as PID 1, an SSH server, sudo and python3.
+# Test fixture image: mirrors a module-supported host (Ubuntu 26.04 or
+# Debian 13; both apt/systemd distros with the same package names) with
+# systemd as PID 1, an SSH server (`ssh` on both), sudo and python3.
 # nftables lets the existing-firewall test reach that refusal, not the missing-nft guard.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

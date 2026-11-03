@@ -7,8 +7,8 @@ driver:
   provider: {name: libvirt}
 platforms:
   - name: k3sb-molecule-firewall
-    box: cloud-image/ubuntu-26.04
-    box_version: 20260927.0.0
+    box: ${K3SB_BOX:-cloud-image/ubuntu-26.04}
+    box_version: ${K3SB_BOX_VERSION:-20260927.0.0}
     memory: 2048
     cpus: 2
     config_options: {synced_folder: false, vm.box_check_update: false}

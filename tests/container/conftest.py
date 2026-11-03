@@ -1,9 +1,11 @@
 """Provide Docker-backed fixtures for the container integration tier.
 
-The tier mirrors the module's deployment: pytest is the controller, a systemd
-container (Ubuntu 26.04, ``openssh-server``, ``sudo``, ``python3``) is a plain
-SSH target that never receives a copy of the repository, and ``run_playbook``
-launches the real ``ansible/k3s-node.yml`` through ``uv run`` as the module
+The tier mirrors the module's deployment: pytest is the controller, a
+systemd container (base image ``K3SB_CONTAINER_IMAGE``, default
+``ubuntu:26.04``; the CI matrix also runs ``debian:13``, always with
+``openssh-server``, ``sudo``, ``python3``) is a plain SSH target that
+never receives a copy of the repository, and ``run_playbook`` launches
+the real ``ansible/k3s-node.yml`` through ``uv run`` as the module
 does. Keep these attribute names stable:
 
     systemd_host.host          testinfra host (docker backend), for arrange and assert steps
@@ -39,7 +41,10 @@ LAUNCH_COMMAND = (
     "uv run --no-project --with-requirements ansible/requirements.txt "
     'ansible-playbook -i localhost, {playbook} -e "$K3SB_VARS"'
 )
-IMAGE_TAG = "k3s-bootstrap-test:ubuntu-2604"
+# The fixture base image, one supported host per matrix leg; the tag
+# carries it so two bases never collide in the local Docker store.
+BASE_IMAGE = os.environ.get("K3SB_CONTAINER_IMAGE", "ubuntu:26.04")
+IMAGE_TAG = f"k3s-bootstrap-test:{BASE_IMAGE.replace(':', '-')}"
 SYSTEMD_WAIT_SECONDS = 60
 SSH_WAIT_SECONDS = 30
 PLAYBOOK_TIMEOUT_SECONDS = 600
@@ -265,7 +270,14 @@ def fixture_controller_key(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Build the test image, then create the controller's ephemeral key (not copied anywhere)."""
     if shutil.which("uv") is None or not PLAYBOOK.is_file():
         pytest.fail(f"the controller needs uv on PATH and {PLAYBOOK}")
-    run_docker("build", "-t", IMAGE_TAG, str(REPO_ROOT / "tests" / "container"))
+    run_docker(
+        "build",
+        "--build-arg",
+        f"BASE_IMAGE={BASE_IMAGE}",
+        "-t",
+        IMAGE_TAG,
+        str(REPO_ROOT / "tests" / "container"),
+    )
     # Load the real host modules before Docker creates the test network namespace.
     # A privileged helper avoids requiring sudo on the machine running pytest.
     run_docker(
