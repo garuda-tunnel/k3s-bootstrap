@@ -42,6 +42,7 @@ NODE_VARS: dict[str, Any] = {
     "api_trusted_cidrs": [],
     "cluster_cidrs": [],
     "grow_root_filesystem": False,
+    "apparmor_container_profile_fix": True,
 }
 GUARD = "inventory : Assert the head matches the node type"
 ROOT_USER = "inventory : Refuse root as the SSH user"

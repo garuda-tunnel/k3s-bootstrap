@@ -1,0 +1,13 @@
+[Unit]
+Description=Load the k3s-bootstrap containerd AppArmor profile override
+After=apparmor.service
+Before={{ k3s_unit }}
+ConditionPathExists={{ k3s_apparmor_profile }}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/apparmor_parser -r -W {{ k3s_apparmor_profile }}
+
+[Install]
+WantedBy={{ k3s_unit }}

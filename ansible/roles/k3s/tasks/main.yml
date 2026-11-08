@@ -20,6 +20,10 @@
         that: preflight_k3s_installed_class is defined
         fail_msg: The k3s play needs the preflight play of the same run (do not skip the preflight tag).
 
+    # Must run before k3s starts; why and how: tasks/apparmor/main.yml.
+    - name: Converge the containerd AppArmor profile override
+      ansible.builtin.include_tasks: apparmor/main.yml
+
     - name: Resolve the kubeconfig group of a server
       # An agent has no kubeconfig: its config directory stays root-only.
       when: node_type != 'agent'

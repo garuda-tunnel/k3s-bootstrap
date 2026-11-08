@@ -3,26 +3,27 @@ locals {
   # token, secret or key content (join data is gathered from the head inside
   # the playbook run).
   run_vars = {
-    node_type            = var.node_type
-    host                 = var.host
-    port                 = var.port
-    head                 = var.head
-    host_key_check       = var.host_key_check
-    bootstrap_user       = var.bootstrap_user
-    ssh_user             = var.ssh_user
-    ssh_private_key_file = var.ssh_private_key_file
-    authorized_keys      = var.authorized_keys
-    sysctls              = var.sysctls
-    kernel_modules       = var.kernel_modules
-    extra_packages       = var.extra_packages
-    k3s_version          = var.k3s_version
-    k3s_config           = var.k3s_config
-    firewall_mode        = var.firewall_mode
-    api_trusted_cidrs    = var.api_trusted_cidrs
-    cluster_cidrs        = var.cluster_cidrs
-    grow_root_filesystem = var.grow_root_filesystem
-    connection_timeout   = var.connection_timeout
-    readiness_timeout    = var.readiness_timeout
+    node_type                      = var.node_type
+    host                           = var.host
+    port                           = var.port
+    head                           = var.head
+    host_key_check                 = var.host_key_check
+    bootstrap_user                 = var.bootstrap_user
+    ssh_user                       = var.ssh_user
+    ssh_private_key_file           = var.ssh_private_key_file
+    authorized_keys                = var.authorized_keys
+    sysctls                        = var.sysctls
+    kernel_modules                 = var.kernel_modules
+    extra_packages                 = var.extra_packages
+    k3s_version                    = var.k3s_version
+    k3s_config                     = var.k3s_config
+    firewall_mode                  = var.firewall_mode
+    api_trusted_cidrs              = var.api_trusted_cidrs
+    cluster_cidrs                  = var.cluster_cidrs
+    grow_root_filesystem           = var.grow_root_filesystem
+    apparmor_container_profile_fix = var.apparmor_container_profile_fix
+    connection_timeout             = var.connection_timeout
+    readiness_timeout              = var.readiness_timeout
   }
 
   ansible_tree_hash = sha256(join("", [

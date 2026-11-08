@@ -43,6 +43,13 @@ argument_specs:
         description: Extra keys for /etc/rancher/k3s/config.yaml. Module-owned keys win; cluster-reset keys are refused. Never secrets.
         type: dict
         required: true
+      apparmor_container_profile_fix:
+        description: >-
+          Preload the containerd default AppArmor profile with stacked-peer
+          signal and ptrace rules for LP 2172422; applied only when the
+          kernel runs AppArmor.
+        type: bool
+        required: true
       readiness_timeout:
         description: Bound for the k3s service start and for the readiness checks, as <n>s, <n>m or <n>h.
         type: str

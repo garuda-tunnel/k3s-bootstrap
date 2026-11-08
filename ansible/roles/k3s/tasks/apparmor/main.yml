@@ -1,0 +1,36 @@
+---
+# Dispatched from tasks/main.yml before k3s starts. Ubuntu 7.0.0-41+
+# kernels (the CVE-2026-90231 backport, LP #2172422) stack the container
+# label as cri-containerd.apparmor.d//&unconfined, which containerd's
+# built-in profile does not allow as a signal/ptrace peer: processes in
+# the same pod can no longer signal each other (gosu hangs, pg_ctl cannot
+# stop, SIGURG denials). The fix preloads the bundled containerd's own
+# default profile plus the stacked-peer rules of containerd PR #14487:
+# containerd loads its built-in copy only when no profile of that name is
+# loaded yet, so a preloaded profile survives and is used. Full story and
+# rollback: the role README.
+- name: Check whether the kernel exposes its AppArmor enablement
+  ansible.builtin.stat:
+    path: /sys/module/apparmor/parameters/enabled
+    get_checksum: false
+  register: k3s_apparmor_parameter
+
+- name: Read the kernel AppArmor enablement flag
+  ansible.builtin.slurp:
+    src: /sys/module/apparmor/parameters/enabled
+  register: k3s_apparmor_flag
+  when: k3s_apparmor_parameter.stat.exists
+
+- name: Note whether the kernel runs AppArmor
+  ansible.builtin.set_fact:
+    k3s_apparmor_enabled: >-
+      {{ k3s_apparmor_parameter.stat.exists
+         and (k3s_apparmor_flag.content | default('') | b64decode | trim) == 'Y' }}
+
+- name: Preload the patched containerd AppArmor profile
+  ansible.builtin.include_tasks: enable.yml
+  when: apparmor_container_profile_fix | bool and k3s_apparmor_enabled | bool
+
+- name: Remove the containerd AppArmor profile override
+  ansible.builtin.include_tasks: disable.yml
+  when: not (apparmor_container_profile_fix | bool and k3s_apparmor_enabled | bool)

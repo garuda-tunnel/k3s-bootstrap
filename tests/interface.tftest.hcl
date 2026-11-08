@@ -326,6 +326,30 @@ run "passes_extra_packages_to_playbook" {
   }
 }
 
+# --- apparmor_container_profile_fix --------------------------------------
+
+run "accepts_default_apparmor_fix_as_true" {
+  command = plan
+
+  assert {
+    condition     = local.run_vars.apparmor_container_profile_fix == true
+    error_message = "apparmor_container_profile_fix must default to true and reach the playbook vars."
+  }
+}
+
+run "passes_apparmor_fix_false_to_playbook" {
+  command = plan
+
+  variables {
+    apparmor_container_profile_fix = false
+  }
+
+  assert {
+    condition     = local.run_vars.apparmor_container_profile_fix == false
+    error_message = "an explicit apparmor_container_profile_fix = false must reach the playbook unchanged."
+  }
+}
+
 # --- firewall and CIDRs ------------------------------------------------
 
 run "rejects_unknown_firewall_mode" {

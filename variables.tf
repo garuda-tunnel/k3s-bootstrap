@@ -232,6 +232,13 @@ variable "grow_root_filesystem" {
   default     = true
 }
 
+variable "apparmor_container_profile_fix" {
+  description = "Preload the containerd default AppArmor profile (/etc/apparmor.d/cri-containerd.apparmor.d: the bundled containerd's template plus the stacked-peer signal and ptrace rules of containerd PR #14487) so processes inside a pod can signal each other on Ubuntu kernels that stack the container label as <profile>//&unconfined (LP #2172422, CVE-2026-90231). Only applied on hosts whose kernel runs AppArmor; the extra allow rules are harmless where the stacked label never appears. A k3s pin without a bundled profile render is refused while this is enabled."
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
 variable "connection_timeout" {
   description = "Overall bound for each SSH connect and for the reconnect after a host-requested reboot, for example 5m; it must cover the host's shutdown and boot time."
   type        = string

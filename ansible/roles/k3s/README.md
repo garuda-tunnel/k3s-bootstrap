@@ -1,10 +1,10 @@
 # Role `k3s`
 
 Installs the pinned k3s for one node type with a module-owned unit and
-`/etc/rancher/k3s/config.yaml`, starts it within `readiness_timeout` and
-writes the completion marker `/var/lib/k3s-bootstrap/installed` (the node
-type) last. `initial` gets `cluster-init`; `server` and `agent` join through
-the head.
+`/etc/rancher/k3s/config.yaml`, preloads the patched containerd AppArmor
+profile, starts k3s within `readiness_timeout` and writes the completion
+marker `/var/lib/k3s-bootstrap/installed` (the node type) last. `initial`
+gets `cluster-init`; `server` and `agent` join through the head.
 
 ## Invariants
 
@@ -25,9 +25,36 @@ the head.
   converge, replacing manual edits; operator settings belong in
   `config.yaml.d/` and unit drop-ins, which the role never writes (README,
   operator duties).
-- The service is reconciled from host state alone, with no handler: an
-  inactive unit is started; an active one is restarted when the config, a
-  `config.yaml.d` fragment, the unit, the binary or the join token file was
+- AppArmor override (`tasks/apparmor/`; LP #2172422,
+  `apparmor_container_profile_fix`, default
+  on, only on a kernel that runs AppArmor): installs
+  `/etc/apparmor.d/cri-containerd.apparmor.d`, the bundled containerd's
+  default profile (`k3s_apparmor_sources` in `vars/main.yml` maps the k3s
+  minor line to the k3s-io/containerd tag it was rendered from, plus the
+  stacked-peer signal and ptrace rules of containerd PR #14487). containerd
+  only loads its built-in copy when no profile of that name is loaded yet,
+  so the preloaded one survives and is used. The render is validated with
+  `apparmor_parser -QTK` before it replaces the file (a syntax error fails
+  the run with nothing loaded or installed). The loaded policy is then
+  reconciled from host state, with no handler: the stamp
+  `/var/lib/k3s-bootstrap/apparmor-loaded` records the checksum of the file
+  whose load completed, and a missing or differing stamp (first run,
+  changed render, or a rollout interrupted between the file and its load)
+  runs `apparmor_parser -r -W`, so an unchanged re-run changes nothing and
+  a lost reload is repeated by the next run. The oneshot unit
+  `k3s-bootstrap-apparmor.service` (`After=apparmor.service`, `Before=` and
+  `WantedBy=` the node's k3s unit) reloads the profile on every boot. A k3s
+  pin whose minor line has no bundled render is refused instead of
+  installing a profile from a mismatched containerd. With the input off or
+  AppArmor off, the profile, unit and stamp files are removed; a loaded
+  profile stays in the kernel (the policy is never unloaded under live
+  containers; see the module README for the rollback procedure), and pods
+  may need recreation to pick up a changed profile. The override becomes
+  redundant once k3s ships a containerd that includes PR #14487.
+- The service is reconciled from host state alone, with no handler of its
+  own: an inactive unit is started; an active one is restarted when the
+  config, a `config.yaml.d` fragment, the unit, the binary or the join token
+  file was
   modified after the running process started (so a restart lost to an
   interrupted run is repeated by the next one). A restart is verified by a
   new InvocationID. The wait stops at a wall-clock deadline and fails with

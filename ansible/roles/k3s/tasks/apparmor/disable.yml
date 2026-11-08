@@ -1,0 +1,39 @@
+---
+# The disable path of apparmor/main.yml: the input is off or the kernel
+# runs no AppArmor; the module owns the files, so it removes them. A
+# loaded profile stays in the kernel until its policy is reloaded:
+# unloading it under live containers would strip their confinement.
+- name: Check whether the profile loader unit is installed
+  ansible.builtin.stat:
+    path: "{{ k3s_apparmor_unit }}"
+    get_checksum: false
+  register: k3s_apparmor_unit_file
+
+- name: Disable the profile loader unit
+  ansible.builtin.systemd_service:
+    name: "{{ k3s_apparmor_unit | basename }}"
+    enabled: false
+    daemon_reload: true
+  when: k3s_apparmor_unit_file.stat.exists
+
+- name: Remove the profile loader unit
+  ansible.builtin.file:
+    path: "{{ k3s_apparmor_unit }}"
+    state: absent
+
+- name: Remove the containerd default profile override
+  ansible.builtin.file:
+    path: "{{ k3s_apparmor_profile }}"
+    state: absent
+
+- name: Remove the stamp of the last completed load
+  # Leaving it would let a later re-enable skip the load although
+  # the kernel no longer runs this module's policy.
+  ansible.builtin.file:
+    path: "{{ k3s_apparmor_loaded_stamp }}"
+    state: absent
+
+- name: Reload systemd after the unit removal
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: k3s_apparmor_unit_file.stat.exists

@@ -1,0 +1,127 @@
+---
+# The enable path of apparmor/main.yml: the input is on and the kernel
+# runs AppArmor.
+- name: Resolve the bundled containerd profile render for this k3s
+  # The pin's minor line (v1.36.5+k3s1 -> 1.36) keys the render table.
+  # Slicing, not a regex backref: a Jinja string literal would read
+  # '\1' as the octal escape \x01, not as a group reference.
+  vars:
+    k3s_apparmor_minor: "{{ (k3s_version[1:] | split('.') | list)[:2] | join('.') }}"
+  ansible.builtin.set_fact:
+    k3s_apparmor_source: >-
+      {{ k3s_apparmor_sources[k3s_apparmor_minor] | default(none) }}
+
+- name: Refuse a k3s pin without a bundled profile render
+  # A profile rendered from a different containerd could silently
+  # drift from what the bundled containerd expects.
+  ansible.builtin.assert:
+    that: k3s_apparmor_source is not none
+    fail_msg: >-
+      apparmor_container_profile_fix is enabled but no containerd AppArmor
+      profile render is bundled for k3s {{ k3s_version }}. Set
+      apparmor_container_profile_fix = false or extend k3s_apparmor_sources
+      in ansible/roles/k3s/vars/main.yml with the render of the containerd
+      this k3s bundles.
+
+- name: Check for the AppArmor userspace
+  ansible.builtin.stat:
+    path: /usr/sbin/apparmor_parser
+    get_checksum: false
+  register: k3s_apparmor_parser
+
+- name: Install the AppArmor userspace
+  when: not k3s_apparmor_parser.stat.exists
+  ansible.builtin.apt:
+    name: apparmor
+    state: present
+    update_cache: true
+
+- name: Create the module state directory
+  # Holds the load stamp below before the node type marker is
+  # written; the later creation of the same directory is idempotent.
+  ansible.builtin.file:
+    path: "{{ k3s_marker_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install the containerd default profile override
+  # validate parses the render before it replaces the file, so an
+  # invalid profile never lands on disk (as the firewall role does
+  # with nft -c).
+  ansible.builtin.template:
+    src: "{{ k3s_apparmor_source.template }}"
+    dest: "{{ k3s_apparmor_profile }}"
+    owner: root
+    group: root
+    mode: '0644'
+    validate: /usr/sbin/apparmor_parser -QTK %s
+  register: k3s_apparmor_override
+
+- name: Check for the stamp of the last completed load
+  ansible.builtin.stat:
+    path: "{{ k3s_apparmor_loaded_stamp }}"
+    get_checksum: false
+  register: k3s_apparmor_stamp_file
+
+- name: Read the stamp of the last completed load
+  ansible.builtin.slurp:
+    src: "{{ k3s_apparmor_loaded_stamp }}"
+  register: k3s_apparmor_stamp
+  when: k3s_apparmor_stamp_file.stat.exists
+
+- name: Note whether the loaded policy must be reconciled
+  # The loaded policy is reconciled from host state, not from this
+  # run's template change: a run interrupted after the file landed
+  # but before its reload leaves the kernel running the old policy
+  # (containerd's built-in render, or an earlier override) under
+  # the same profile name, and an unchanged file would never fire a
+  # change-notified handler again. The stamp holds the checksum of
+  # the exact file whose load completed, so a missing or differing
+  # stamp catches the interrupted rollout, a changed render and a
+  # first install in one comparison, and an unchanged re-run stays
+  # changed=0. The kernel side is not diffable instead: the
+  # securityfs profiles dump lists names and modes only, and the
+  # parser's compiled blob does not hash to the kernel's
+  # per-profile sha256, so the loaded content cannot be matched to
+  # the file without loading it.
+  ansible.builtin.set_fact:
+    k3s_apparmor_load_needed: >-
+      {{ not (k3s_apparmor_stamp_file.stat.exists | default(false))
+         or (k3s_apparmor_stamp.content | default('') | b64decode | trim)
+            != k3s_apparmor_override.checksum }}
+
+- name: Replace the loaded profile in place, before k3s starts
+  ansible.builtin.command:
+    argv: [/usr/sbin/apparmor_parser, -r, -W, "{{ k3s_apparmor_profile }}"]
+  when: k3s_apparmor_load_needed | bool
+  changed_when: true
+
+- name: Record the completed load
+  # Written only after the reload succeeded, so a failed or
+  # interrupted load leaves the stale or absent stamp behind and
+  # the next run reconciles again.
+  ansible.builtin.copy:
+    content: "{{ k3s_apparmor_override.checksum }}\n"
+    dest: "{{ k3s_apparmor_loaded_stamp }}"
+    owner: root
+    group: root
+    mode: '0644'
+  when: k3s_apparmor_load_needed | bool
+
+- name: Install the profile loader unit
+  ansible.builtin.template:
+    src: apparmor/k3s-bootstrap-apparmor.service.j2
+    dest: "{{ k3s_apparmor_unit }}"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Enable the profile loader unit
+  # The immediate load of this run is the reconciliation above; the
+  # unit only guarantees the same on every later boot, before k3s.
+  ansible.builtin.systemd_service:
+    name: "{{ k3s_apparmor_unit | basename }}"
+    enabled: true
+    daemon_reload: true

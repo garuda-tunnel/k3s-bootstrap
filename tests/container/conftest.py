@@ -93,6 +93,7 @@ def node_vars(node: SystemdHost) -> dict[str, Any]:
         "api_trusted_cidrs": [],
         "cluster_cidrs": [],
         "grow_root_filesystem": False,
+        "apparmor_container_profile_fix": True,
     }
 
 

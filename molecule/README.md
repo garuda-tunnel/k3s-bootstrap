@@ -24,7 +24,7 @@ the VM scenarios do not add a separate runtime case. The `cluster-cidr`/`service
 
 | Scenario | VMs | What it proves |
 |---|---|---|
-| `default` | 1 | `initial` on embedded etcd: etcd datastore with no `state.db`, module-owned config and node-type marker, no token in the module's files, kubeconfig group (the `ssh_user` reads the node list with it, but not `config.yaml`, and cannot list the `0710` directory), restart survival, no-op reconverge, config-change restart without reinstall, bounded failure with a journal tail and no marker written. Readiness negatives: a world-readable kubeconfig, a stopped unit (bounded by a 30 s timeout) and a foreign CA (fails at once). Preflight refusals (node type change, downgrade, unreadable version, SQLite) are tested in `tests/container`. |
+| `default` | 1 | `initial` on embedded etcd: etcd datastore with no `state.db`, module-owned config and node-type marker, no token in the module's files, kubeconfig group (the `ssh_user` reads the node list with it, but not `config.yaml`, and cannot list the `0710` directory), restart survival, no-op reconverge, config-change restart without reinstall, bounded failure with a journal tail and no marker written. Readiness negatives: a world-readable kubeconfig, a stopped unit (bounded by a 30 s timeout) and a foreign CA (fails at once). Preflight refusals (node type change, downgrade, unreadable version, SQLite) are tested in `tests/container`. The containerd AppArmor profile override: both stacked-peer rules installed anchored from the mapped containerd tag, the installed file parses (`apparmor_parser -QTK`), the loader unit is wanted by `k3s.service`, ordered `After=apparmor.service` and `Before=k3s.service`, the profile is loaded and the loaded policy is ours (kernel per-profile sha256, so a no-op loader fails the test), the disabled input installs nothing and never unloads the live policy, a disabled AppArmor (the kernel parameter shadowed with N by a bind mount) installs nothing, the next default converge restores the override, a rollout interrupted between the file and its load is reconciled by the next converge (the kernel sha256 returns to the patched policy), and an unmapped k3s minor pin is refused with its reason. |
 | `firewall` | 1 | The managed nftables gate: SSH stays reachable, the API and etcd ports answer on loopback and from the trusted controller but time out (not refuse) from it once untrusted, foreign nft tables survive managed and off mode, an invalid ruleset is refused before replacing the live table, enabled UFW and UFW chains left loaded are rejected, and off mode is refused while the module unit file or table exists, then passes after the manual cleanup (unit, ruleset and table removed). |
 | `cluster` | 3 | `initial`, `server` and `agent` joined through the initial node as head, converged at `-vvv`: three Ready nodes, two control-plane; no bootstrap token left on the head; the join token file `0600` root and unreadable to the SSH user; config directory `0710` on the server and `0700` on the agent, which has no `k3s.yaml`; the agent Ready again after a restart with its token deleted; joined re-runs change nothing and run no token task; no token secret in any controller output. |
 | `host` | 1 | Host role and reboot handler: a seeded `/run/reboot-required` on a first install gives one reboot before k3s is installed (boot id changes, request cleared, the idempotence converge reports no change), the extra package `jq` from `extra_packages` is installed, kernel modules and sysctls effective, persisted and surviving that reboot and a k3s restart, a nonexistent module refused before any change, an installed node never rebooted (an etcd datastore is never pristine, so the reboot gate never depends on the marker), and root filesystem growth without data loss. |
@@ -81,6 +81,26 @@ re-running it re-applies the module. Finish with
 
 The scenario runs the whole sequence and destroys its VMs at the end.
 `cluster` and `recovery` take the longest (three VMs, real joins).
+
+## Manual verification: stacked-label sibling signals
+
+Molecule proves the profile is installed, loaded and reconciled, but not
+that signals between sibling processes in one pod actually pass: that
+needs a pod running under the stacked label
+`cri-containerd.apparmor.d//&unconfined`, which only an affected kernel
+(Ubuntu 7.0.0-41 and later with
+`kernel.apparmor_restrict_unprivileged_unconfined = 1`) produces. Verify
+by hand on an affected node, with the override disabled (expect the kill
+to be denied and an AppArmor `DENIED` line in the kernel log) and then
+enabled (expect `rc=0` and no denial):
+
+```sh
+kubectl exec <pod> -- sh -c 'sleep 30 & kill $!; echo rc=$?'
+dmesg | grep -i apparmor | tail
+```
+
+The z2g smoke playbook of the consumer repo should carry this probe once
+it runs workloads on affected kernels.
 
 ## Leftover cleanup
 

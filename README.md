@@ -145,6 +145,61 @@ an initialised server; enabled ufw or firewalld with `firewall_mode =
 `nft destroy table inet k3s_bootstrap`, delete the unit and
 `/etc/k3s-bootstrap/firewall.nft`, `systemctl daemon-reload`).
 
+The k3s play refuses a `k3s_version` whose minor line (the `x.y` of the
+pin) has no bundled containerd AppArmor profile render while
+`apparmor_container_profile_fix` is enabled (the default): a profile
+rendered from a different containerd could drift from what the bundled
+containerd expects. Set the input to `false` or extend the mapping in
+`ansible/roles/k3s/vars/main.yml`.
+
+## AppArmor intra-pod signals (Ubuntu kernels)
+
+Ubuntu kernels 7.0.0-41 and later (the CVE-2026-90231 backport,
+[LP #2172422](https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2172422))
+stack the AppArmor label of a container as
+`cri-containerd.apparmor.d//&unconfined`, a peer containerd's built-in
+profile does not allow: processes in the same pod can no longer signal each
+other (gosu hangs, `pg_ctl` cannot stop postgres, SIGURG/SIGTERM denials in
+dmesg). With `apparmor_container_profile_fix = true` (default) on a host
+whose kernel runs AppArmor, the module preloads
+`/etc/apparmor.d/cri-containerd.apparmor.d` — the bundled containerd's own
+default profile plus the stacked-peer rules of
+[containerd PR #14487](https://github.com/containerd/containerd/pull/14487)
+— validates the render with `apparmor_parser -QTK` before the file is
+replaced, reconciles the loaded policy from host state (an interrupted
+rollout is repaired by the next run) and reloads it on every boot
+(`k3s-bootstrap-apparmor.service`,
+`After=apparmor.service`, `Before=k3s`). containerd keeps the preloaded
+profile: it only loads its built-in copy when no profile of that name is
+loaded yet.
+
+- The default is `true` because the extra allow rules only ever match the
+  stacked label: on unaffected kernels and on Debian hosts (no forced
+  stacking) they are inert. The trade-off: upgrading to a k3s minor line
+  the module does not map yet fails the run until the module is updated or
+  the input is set to `false`.
+- A pod keeps the label it was created with: after enabling (or changing)
+  the profile, recreate the affected pods (for example
+  `kubectl rollout restart`) to pick up the corrected behaviour.
+- Turning the input off removes the installed files but not the loaded
+  policy: a loaded profile stays in the kernel until it is replaced or the
+  node reboots. An AppArmor policy reload over the files present
+  (`rc.apparmor.functions`, `apparmor_parser --replace`) does not remove a
+  fileless loaded profile, and containerd's load-once check keeps whatever
+  is loaded, so a node keeps running this override after the files are
+  gone and nodes can be mixed: rebooted ones run containerd's built-in
+  copy again, non-rebooted ones keep the override. To roll the override
+  back on a live node, either reboot it, or replace the policy with
+  containerd's built-in profile rendered from the same template without
+  the two stacked-peer lines
+  (`apparmor_parser -r <unpatched-render>`), then recreate the pods so
+  they pick up the corrected label. Never unload the profile
+  (`apparmor_parser -R`) under live containers: it would strip their
+  confinement.
+- The override becomes redundant once k3s ships a containerd that includes
+  PR #14487; watch the k3s release notes for the containerd bump and then
+  set the input to `false`.
+
 ## Inputs and outputs
 
 See `variables.tf` and `outputs.tf` for the annotated list. `head` is
@@ -159,6 +214,7 @@ its data safety (`data-dir`, `datastore-endpoint`, `cluster-reset`,
 | Optional input | Type | Default | Description |
 |---|---|---|---|
 | `extra_packages` | `list(string)` | `[]` | Additional apt packages to install (`state: present`, never removed by the module). Each name must match `^[a-z0-9][a-z0-9+.-]+$`. Listing `qemu-guest-agent` also enables and starts its service. |
+| `apparmor_container_profile_fix` | `bool` | `true` | Preload the bundled containerd's default AppArmor profile with the stacked-peer signal and ptrace rules of containerd PR #14487, so intra-pod signals work on Ubuntu kernels affected by LP #2172422 (see [AppArmor intra-pod signals](#apparmor-intra-pod-signals-ubuntu-kernels)). Only applied on hosts whose kernel runs AppArmor; refused for a k3s minor line without a bundled profile render. |
 
 Outputs, all null on agents and available once the node is ready: `head`
 (this node's SSH coordinates, for `head = module.<name>.head`),

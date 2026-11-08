@@ -5,3 +5,26 @@ k3s_token_file: /etc/rancher/k3s/join-token
 # The upstream unit names; preflight refuses a node whose unit disagrees.
 k3s_service_name: "{{ 'k3s-agent' if node_type == 'agent' else 'k3s' }}"
 k3s_unit: "{{ k3s_service_name }}.service"
+
+# Containerd default AppArmor profile override (LP #2172422): files of the
+# k3s role only, so they live here and not in group_vars.
+k3s_apparmor_profile: /etc/apparmor.d/cri-containerd.apparmor.d
+k3s_apparmor_unit: /etc/systemd/system/k3s-bootstrap-apparmor.service
+# Checksum of the profile file whose load into the kernel last completed.
+# The reconcile step compares it with the installed file and reloads when
+# it is missing or differs (first run, changed render, or a rollout that
+# was interrupted between the file and its load).
+k3s_apparmor_loaded_stamp: "{{ k3s_marker_path | dirname }}/apparmor-loaded"
+# Renders of the bundled containerd's default AppArmor profile, keyed by the
+# k3s minor line (the x.y of the pin). Each template file is rendered from
+# contrib/apparmor/template.go of the k3s-io/containerd fork tag named in
+# containerd_tag (DaemonProfile=unconfined, no rootlesskit, abi 3.0, distro
+# tunables and abstractions present) plus the stacked-peer rules of containerd
+# PR #14487. A pin whose minor line is missing here is refused while
+# apparmor_container_profile_fix is enabled: a profile rendered from a
+# different containerd could silently drift from what containerd expects.
+# Extend this table (and add the rendered template) for a new k3s line.
+k3s_apparmor_sources:
+  "1.36":
+    containerd_tag: v2.3.4-k3s1.36
+    template: apparmor/cri-containerd.apparmor.d-1.36.j2
