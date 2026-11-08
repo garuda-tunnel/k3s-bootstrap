@@ -1,130 +1,338 @@
 ---
-# The containerd AppArmor profile override end to end: the installed render
-# carries both stacked-peer rules of the mapped containerd tag and parses, the
-# loader unit is ordered around apparmor and k3s and wanted by k3s, the
-# profile is loaded and the loaded policy is ours (kernel per-profile sha256,
-# so a no-op loader fails), the disabled input installs nothing and never
-# unloads the live policy, a disabled AppArmor (kernel parameter shadowed)
-# installs nothing, an interrupted rollout is reconciled by the next converge
-# and an unmapped k3s minor pin is refused with its reason. Runs on the
-# instance from a localhost play; inputs: k3sb_instance, k3sb_apparmor_*.
-- name: Read the installed override and its live systemd ordering
+# Dedicated VM only: verify runc policy replacement, boot/reload persistence,
+# rollback, interrupted convergence and v0.3.1 migration without unloading.
+- name: Inspect the installed runc attachment and loaded policies
   become: true
   delegate_to: "{{ k3sb_instance }}"
   block:
-    - name: Read the installed profile override
+    - name: Read the installed profile
       ansible.builtin.slurp:
         src: "{{ k3sb_apparmor_profile }}"
       register: k3sb_apparmor_profile_raw
+
+    - name: Read the distro conffile
+      ansible.builtin.slurp:
+        src: /etc/apparmor.d/runc
+      register: k3sb_apparmor_stock_raw
 
     - name: Parse the installed profile without loading it
       ansible.builtin.command:
         argv: [/usr/sbin/apparmor_parser, -QTK, "{{ k3sb_apparmor_profile }}"]
       changed_when: false
 
-    - name: Read the loader unit ordering
+    - name: Inspect the distro disable marker
+      ansible.builtin.stat:
+        path: "{{ k3sb_apparmor_disable_link }}"
+        get_checksum: false
+      register: k3sb_apparmor_link
+
+    - name: Read the AppArmor boot ordering
       ansible.builtin.command:
-        argv: [systemctl, show, k3s-bootstrap-apparmor.service, "--property={{ item }}", --value]
-      loop: [After, Before]
+        argv: [systemctl, show, apparmor.service, --property=Before, --value]
       changed_when: false
       register: k3sb_apparmor_ordering
 
-    - name: Read what pulls the loader in before k3s
+    - name: Read the k3s default boot dependencies
       ansible.builtin.command:
-        argv: [systemctl, show, k3s.service, --property=Wants, --value]
+        argv: [systemctl, show, k3s.service, --property=After, --value]
       changed_when: false
-      register: k3sb_apparmor_wants
+      register: k3sb_k3s_ordering
 
-    - name: Look for the profile in the loaded kernel policy
-      # The command fails when the profile is not loaded: that is the
-      # assertion.
+    - name: Read the sha256 of the loaded runc policy
       ansible.builtin.command:
-        argv: [grep, "^cri-containerd.apparmor.d ", /sys/kernel/security/apparmor/profiles]
-      changed_when: false
-
-    - name: Read the sha256 of the loaded profile policy
-      # Kernel truth: the per-profile sha256 under securityfs changes
-      # with every content change of the loaded policy (the securityfs
-      # profiles dump itself lists names and modes only), so the phases
-      # below can prove that a converge replaced the loaded policy and
-      # that a disabled input left it untouched. The glob absorbs the
-      # kernel's per-load id suffix on the directory name.
-      ansible.builtin.command:
-        argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/cri-containerd.apparmor.d.*/sha256"]
+        argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/runc.*/sha256"]
       changed_when: false
       register: k3sb_loaded_sha
 
-- name: Assert the override carries both stacked-peer rules and is loaded
-  vars:
-    k3sb_profile_text: "{{ k3sb_apparmor_profile_raw.content | b64decode }}"
+- name: Assert only the attachment changed and AppArmor precedes k3s
   ansible.builtin.assert:
     that:
-      # Anchored full-line matches: a commented-out or mangled rule
-      # line must fail, not merely a missing substring.
-      - k3sb_profile_text is regex('(?m)^  signal \(send,receive\) peer=cri-containerd\.apparmor\.d,$')
-      - k3sb_profile_text is regex('(?m)^  ptrace \(trace,tracedby,read,readby\) peer=cri-containerd\.apparmor\.d,$')
-      - k3sb_profile_text is regex('(?m)^  signal \(send,receive\) peer=cri-containerd\.apparmor\.d//&unconfined,$')
-      - k3sb_profile_text is regex('(?m)^  ptrace \(trace,tracedby,read,readby\) peer=cri-containerd\.apparmor\.d//&unconfined,$')
-      - k3sb_profile_text is regex('(?m)^# .*k3s-io/containerd tag v2\.3\.4-k3s1\.36')
+      - >-
+        (k3sb_apparmor_profile_raw.content | b64decode)
+        == (k3sb_apparmor_stock_raw.content | b64decode
+            | replace('/usr/{bin,sbin}/runc', '/{usr/{bin,sbin},var/lib/rancher/k3s/data/*/bin}/runc'))
+      - k3sb_apparmor_link.stat.islnk
+      - k3sb_apparmor_link.stat.lnk_source == '/etc/apparmor.d/runc'
       - k3sb_loaded_sha.stdout | trim | length > 0
-      - "'apparmor.service' in k3sb_apparmor_ordering.results[0].stdout.split()"
-      - "'k3s.service' in k3sb_apparmor_ordering.results[1].stdout.split()"
-      - "'k3s-bootstrap-apparmor.service' in k3sb_apparmor_wants.stdout.split()"
+      - "'sysinit.target' in k3sb_apparmor_ordering.stdout.split()"
+      - "'sysinit.target' in k3sb_k3s_ordering.stdout.split()"
 
-- name: Converge with the profile fix disabled
+- name: Verify service reload and direct package-style parsing skip the distro file
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  block:
+    - name: Reload AppArmor as its package does on upgrade
+      ansible.builtin.systemd_service:
+        name: apparmor.service
+        state: reloaded
+
+    - name: Try the direct dh_apparmor parser invocation
+      ansible.builtin.command:
+        argv: [/usr/sbin/apparmor_parser, -r, -T, -W, /etc/apparmor.d/runc]
+      changed_when: false
+
+    - name: Read the runc policy after both reload paths
+      ansible.builtin.command:
+        argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/runc.*/sha256"]
+      changed_when: false
+      register: k3sb_reloaded_sha
+
+- name: Assert reload cannot replace our policy with the distro attachment
+  ansible.builtin.assert:
+    that: k3sb_reloaded_sha.stdout | trim == k3sb_loaded_sha.stdout | trim
+
+- name: Check the restriction on this kernel
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  ansible.builtin.command:
+    argv: [/usr/sbin/sysctl, -e, -n, kernel.apparmor_restrict_unprivileged_unconfined]
+  changed_when: false
+  register: k3sb_apparmor_restriction
+
+- name: Prove embedded runc attaches on every kernel
+  ansible.builtin.include_tasks: apparmor-pod.yml
+  vars:
+    k3sb_apparmor_probe_type: Unconfined
+    k3sb_apparmor_expected_label: runc (unconfined)
+
+- name: Verify a new RuntimeDefault container has no unconfined stack
+  when: k3sb_apparmor_restriction.stdout | trim == '1'
+  ansible.builtin.include_tasks: apparmor-pod.yml
+  vars:
+    k3sb_apparmor_probe_type: RuntimeDefault
+    k3sb_apparmor_expected_label: cri-containerd.apparmor.d (enforce)
+
+- name: Verify the standard AppArmor boot path without a converge
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  block:
+    - name: Reboot once and wait for the k3s service
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        test_command: systemctl is-active k3s.service
+
+    - name: Wait for the node after reboot
+      ansible.builtin.command:
+        argv: [k3s, kubectl, wait, --for=condition=Ready, node, --all, --timeout=180s]
+      changed_when: false
+
+    - name: Read the boot-loaded runc policy sha256
+      ansible.builtin.command:
+        argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/runc.*/sha256"]
+      changed_when: false
+      register: k3sb_boot_sha
+
+    - name: Assert boot loaded exactly the module policy before k3s
+      ansible.builtin.assert:
+        that: k3sb_boot_sha.stdout | trim == k3sb_loaded_sha.stdout | trim
+
+    - name: Read the live containerd policy baseline after reboot
+      ansible.builtin.command:
+        argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/cri-containerd.apparmor.d.*/sha256"]
+      changed_when: false
+      register: k3sb_containerd_sha
+
+- name: Prove embedded runc still attaches after reboot on every kernel
+  ansible.builtin.include_tasks: apparmor-pod.yml
+  vars:
+    k3sb_apparmor_probe_type: Unconfined
+    k3sb_apparmor_expected_label: runc (unconfined)
+
+- name: Verify a new RuntimeDefault container is unstacked after reboot
+  when: k3sb_apparmor_restriction.stdout | trim == '1'
+  ansible.builtin.include_tasks: apparmor-pod.yml
+  vars:
+    k3sb_apparmor_probe_type: RuntimeDefault
+    k3sb_apparmor_expected_label: cri-containerd.apparmor.d (enforce)
+
+- name: Seed the obsolete v0.3.1 artifacts
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  block:
+    - name: Seed the old profile file and stamp
+      ansible.builtin.copy:
+        dest: "{{ item }}"
+        content: '# obsolete v0.3.1 artifact for the migration test'
+        owner: root
+        group: root
+        mode: '0644'
+      loop:
+        - /etc/apparmor.d/cri-containerd.apparmor.d
+        - /var/lib/k3s-bootstrap/apparmor-loaded
+
+    - name: Seed the obsolete oneshot loader
+      # No policy load: migration must remove the unit, not execute it.
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/k3s-bootstrap-apparmor.service
+        content: |
+          [Unit]
+          Description=Obsolete loader migration fixture
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/true
+          [Install]
+          WantedBy=k3s.service
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable and start the obsolete loader fixture
+      ansible.builtin.systemd_service:
+        name: k3s-bootstrap-apparmor.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Simulate activation interrupted after loading but before its stamp
+      ansible.builtin.file:
+        path: /var/lib/k3s-bootstrap/apparmor-runc-loaded
+        state: absent
+
+- name: Converge with the fix disabled to migrate and restore stock
   ansible.builtin.include_tasks: ../shared/tasks/apply.yml
   vars:
     k3sb_apply_vars: {apparmor_container_profile_fix: false}
 
-- name: Look for the override after the disabled converge
+- name: Inspect rollback and migration results
   become: true
   delegate_to: "{{ k3sb_instance }}"
-  ansible.builtin.stat:
-    path: "{{ item }}"
-    get_checksum: false
-  loop: ["{{ k3sb_apparmor_profile }}", "{{ k3sb_apparmor_unit }}"]
-  register: k3sb_apparmor_disabled_files
+  block:
+    - name: Look for all managed and obsolete files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: false
+      loop:
+        - "{{ k3sb_apparmor_profile }}"
+        - "{{ k3sb_apparmor_disable_link }}"
+        - /var/lib/k3s-bootstrap/apparmor-runc-loaded
+        - /var/lib/k3s-bootstrap/apparmor-loaded
+        - /etc/apparmor.d/cri-containerd.apparmor.d
+        - /etc/systemd/system/k3s-bootstrap-apparmor.service
+        - /etc/systemd/system/k3s.service.wants/k3s-bootstrap-apparmor.service
+      register: k3sb_apparmor_disabled_files
 
-- name: Assert the disabled input left nothing behind
+    - name: Read the stock runc policy sha256
+      ansible.builtin.command:
+        argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/runc.*/sha256"]
+      changed_when: false
+      register: k3sb_stock_sha
+
+    - name: Read the live containerd policy after migration
+      ansible.builtin.command:
+        argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/cri-containerd.apparmor.d.*/sha256"]
+      changed_when: false
+      register: k3sb_containerd_after_sha
+
+    - name: Read the distro file after rollback
+      ansible.builtin.slurp:
+        src: /etc/apparmor.d/runc
+      register: k3sb_stock_after
+
+- name: Assert stock was restored without altering live container confinement or the conffile
   ansible.builtin.assert:
-    that: k3sb_apparmor_disabled_files.results | selectattr('stat.exists') | list | length == 0
+    that:
+      - k3sb_apparmor_disabled_files.results | selectattr('stat.exists') | list | length == 0
+      - k3sb_stock_sha.stdout | trim | length > 0
+      - k3sb_stock_sha.stdout | trim != k3sb_loaded_sha.stdout | trim
+      - k3sb_containerd_after_sha.stdout | trim == k3sb_containerd_sha.stdout | trim
+      - k3sb_stock_after.content == k3sb_apparmor_stock_raw.content
 
-- name: Read the loaded policy sha256 after the disabled converge
+- name: Restore the default attachment
+  ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+
+- name: Simulate an interrupted load with our file present but stock policy loaded
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  block:
+    - name: Stage the stock policy under a name not disabled by the marker
+      ansible.builtin.copy:
+        content: "{{ k3sb_apparmor_stock_raw.content | b64decode }}"
+        dest: /var/tmp/k3sb-stock-runc
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Load the stock policy over ours without touching our file
+      ansible.builtin.command:
+        argv: [/usr/sbin/apparmor_parser, -r, -K, /var/tmp/k3sb-stock-runc]
+      changed_when: true
+
+    - name: Remove the completed-load stamp
+      ansible.builtin.file:
+        path: /var/lib/k3s-bootstrap/apparmor-runc-loaded
+        state: absent
+
+    - name: Read the policy sha256 before reconciliation
+      ansible.builtin.command:
+        argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/runc.*/sha256"]
+      changed_when: false
+      register: k3sb_interrupted_sha
+  always:
+    - name: Remove the stock policy scratch file
+      ansible.builtin.file:
+        path: /var/tmp/k3sb-stock-runc
+        state: absent
+
+- name: Assert the interrupted rollout really runs stock
+  ansible.builtin.assert:
+    that: k3sb_interrupted_sha.stdout | trim == k3sb_stock_sha.stdout | trim
+
+- name: Reconcile the interrupted load
+  ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+
+- name: Read the reconciled runc policy sha256
   become: true
   delegate_to: "{{ k3sb_instance }}"
   ansible.builtin.command:
-    argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/cri-containerd.apparmor.d.*/sha256"]
+    argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/runc.*/sha256"]
   changed_when: false
-  register: k3sb_disabled_sha
+  register: k3sb_reconciled_sha
 
-- name: Assert the disabled input never unloaded the live policy
-  # The files are gone; the loaded policy must be byte-identical to the
-  # one measured before, so live confinement is kept.
+- name: Assert exactly our loaded policy was restored
   ansible.builtin.assert:
-    that: k3sb_disabled_sha.stdout | trim == k3sb_loaded_sha.stdout | trim
+    that: k3sb_reconciled_sha.stdout | trim == k3sb_loaded_sha.stdout | trim
 
-- name: Converge with the defaults again
-  ansible.builtin.include_tasks: ../shared/tasks/apply.yml
-
-- name: Look for the override after the default converge
+- name: Simulate rollback interrupted after removing files but before reloading stock
   become: true
   delegate_to: "{{ k3sb_instance }}"
-  ansible.builtin.stat:
-    path: "{{ item }}"
-    get_checksum: false
-  loop: ["{{ k3sb_apparmor_profile }}", "{{ k3sb_apparmor_unit }}"]
-  register: k3sb_apparmor_restored_files
+  block:
+    - name: Record the pending restoration intent
+      ansible.builtin.copy:
+        content: "restore-stock\n"
+        dest: /var/lib/k3s-bootstrap/apparmor-runc-loaded
+        owner: root
+        group: root
+        mode: '0644'
 
-- name: Assert the default converge restored the override
-  # Makes the disabled-AppArmor phase below non-vacuous: it starts from
-  # both files present.
+    - name: Remove the managed files without reloading stock
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: ["{{ k3sb_apparmor_profile }}", "{{ k3sb_apparmor_disable_link }}"]
+
+- name: Finish the interrupted rollback
+  ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+  vars:
+    k3sb_apply_vars: {apparmor_container_profile_fix: false}
+
+- name: Read the stock runc policy after the interrupted rollback
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  ansible.builtin.command:
+    argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/runc.*/sha256"]
+  changed_when: false
+  register: k3sb_rollback_sha
+
+- name: Assert the pending restoration reloaded stock even though the files were already absent
   ansible.builtin.assert:
-    that: k3sb_apparmor_restored_files.results | rejectattr('stat.exists') | list | length == 0
+    that: k3sb_rollback_sha.stdout | trim == k3sb_stock_sha.stdout | trim
+
+- name: Restore the default attachment before the disabled-kernel test
+  ansible.builtin.include_tasks: ../shared/tasks/apply.yml
 
 - name: Converge with AppArmor reporting disabled
-  # A bind mount shadows the kernel's enablement parameter with N for the
-  # whole VM, standing in for a host booted without AppArmor; the always
-  # clause restores the real view however the phase ends.
+  # Dedicated VM only: shadow the parameter, not the real kernel policy.
   block:
     - name: Write a disabled AppArmor parameter
       become: true
@@ -143,19 +351,19 @@
         argv: [mount, --bind, /var/tmp/k3sb-apparmor-enabled, /sys/module/apparmor/parameters/enabled]
       changed_when: true
 
-    - name: Apply the module playbook with AppArmor reporting disabled
+    - name: Apply with AppArmor reporting disabled
       ansible.builtin.include_tasks: ../shared/tasks/apply.yml
 
-    - name: Look for the override under disabled AppArmor
+    - name: Look for the module profile and disable marker
       become: true
       delegate_to: "{{ k3sb_instance }}"
       ansible.builtin.stat:
         path: "{{ item }}"
         get_checksum: false
-      loop: ["{{ k3sb_apparmor_profile }}", "{{ k3sb_apparmor_unit }}"]
+      loop: ["{{ k3sb_apparmor_profile }}", "{{ k3sb_apparmor_disable_link }}"]
       register: k3sb_apparmor_gate_files
 
-    - name: Assert nothing stays installed while AppArmor is disabled
+    - name: Assert AppArmor off removes our files
       ansible.builtin.assert:
         that: k3sb_apparmor_gate_files.results | selectattr('stat.exists') | list | length == 0
   always:
@@ -166,106 +374,46 @@
         argv: [umount, /sys/module/apparmor/parameters/enabled]
       changed_when: false
 
-- name: Converge with the defaults a last time
+    - name: Remove the enablement scratch file
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      ansible.builtin.file:
+        path: /var/tmp/k3sb-apparmor-enabled
+        state: absent
+
+- name: Restore the default attachment after the disabled-kernel test
   ansible.builtin.include_tasks: ../shared/tasks/apply.yml
 
-- name: Look for the override after the final converge
-  become: true
-  delegate_to: "{{ k3sb_instance }}"
-  ansible.builtin.stat:
-    path: "{{ k3sb_apparmor_profile }}"
-    get_checksum: false
-  register: k3sb_apparmor_final
-
-- name: Assert the override is back
-  ansible.builtin.assert:
-    that: k3sb_apparmor_final.stat.exists
-
-- name: Regression of a rollout interrupted between the file and its load
-  # Reproduces the interrupted first rollout: the run wrote the profile
-  # file and died before loading it, so the kernel still runs the
-  # unpatched policy under the same profile name and the load stamp of
-  # a completed run is absent. The converge below must reconcile the
-  # loaded policy from host state alone; a reload notified only by the
-  # template change would be a no-op (the file did not change) and the
-  # final assert fails.
+- name: Verify restricted kernels refuse a missing distro policy
+  when: k3sb_apparmor_restriction.stdout | trim == '1'
   block:
-    - name: Render the unpatched profile to a scratch file
-      # The installed override minus the two stacked-peer lines stands
-      # in for the unpatched policy the interrupted node still runs.
+    - name: Remove the distro policy on this dedicated VM
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      ansible.builtin.file:
+        path: /etc/apparmor.d/runc
+        state: absent
+
+    - name: Require refusal before k3s can start with a missing stock policy
+      ansible.builtin.include_tasks: ../shared/tasks/reject.yml
+      vars:
+        k3sb_variant_vars: {}
+        k3sb_reject_task: 'k3s : Refuse restricted unconfined without a distro runc profile'
+
+  always:
+    - name: Restore the distro conffile byte for byte
       become: true
       delegate_to: "{{ k3sb_instance }}"
       ansible.builtin.copy:
-        content: "{{ k3sb_apparmor_profile_raw.content | b64decode
-                    | regex_replace('(?m)^.*peer=cri-containerd\\.apparmor\\.d//&unconfined.*\\n?', '') }}"
-        dest: /tmp/k3sb-unpatched.profile
+        content: "{{ k3sb_apparmor_stock_raw.content | b64decode }}"
+        dest: /etc/apparmor.d/runc
         owner: root
         group: root
-        mode: '0600'
+        mode: '0644'
 
-    - name: Load the unpatched policy over the override
-      become: true
-      delegate_to: "{{ k3sb_instance }}"
-      ansible.builtin.command:
-        argv: [/usr/sbin/apparmor_parser, -r, -K, /tmp/k3sb-unpatched.profile]
-      changed_when: true
+- name: Verify an unchanged final converge is a no-op
+  ansible.builtin.include_tasks: ../shared/tasks/apply.yml
 
-    - name: Remove the scratch file
-      become: true
-      delegate_to: "{{ k3sb_instance }}"
-      ansible.builtin.file:
-        path: /tmp/k3sb-unpatched.profile
-        state: absent
-
-    - name: Remove the stamp of the last completed load
-      # The interrupted run never recorded one.
-      become: true
-      delegate_to: "{{ k3sb_instance }}"
-      ansible.builtin.file:
-        path: /var/lib/k3s-bootstrap/apparmor-loaded
-        state: absent
-
-    - name: Read the loaded policy sha256 under the unpatched policy
-      become: true
-      delegate_to: "{{ k3sb_instance }}"
-      ansible.builtin.command:
-        argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/cri-containerd.apparmor.d.*/sha256"]
-      changed_when: false
-      register: k3sb_unpatched_sha
-
-    - name: Assert the unpatched policy is loaded and differs from ours
-      # Differing shas prove the out-of-band load really replaced the
-      # policy, so the final assert cannot pass vacuously.
-      ansible.builtin.assert:
-        that:
-          - k3sb_unpatched_sha.stdout | trim | length > 0
-          - k3sb_unpatched_sha.stdout | trim != k3sb_loaded_sha.stdout | trim
-
-    - name: Converge with the defaults
-      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
-
-    - name: Read the loaded policy sha256 after the converge
-      become: true
-      delegate_to: "{{ k3sb_instance }}"
-      ansible.builtin.command:
-        argv: [/bin/sh, -c, "cat /sys/kernel/security/apparmor/policy/profiles/cri-containerd.apparmor.d.*/sha256"]
-      changed_when: false
-      register: k3sb_reconciled_sha
-
-    - name: Assert the converge reconciled exactly our policy
-      ansible.builtin.assert:
-        that: k3sb_reconciled_sha.stdout | trim == k3sb_loaded_sha.stdout | trim
-
-- name: Refuse a k3s pin whose minor line has no bundled render
-  # The guard must stop the run before a profile rendered from a
-  # mismatched containerd is installed, and nothing may change.
-  ansible.builtin.include_tasks: ../shared/tasks/reject.yml
-  vars:
-    k3sb_variant_vars: {k3s_version: v1.37.0+k3s1}
-    k3sb_reject_task: "k3s : Refuse a k3s pin without a bundled profile render"
-
-- name: Assert the refusal named the unmapped pin
-  # reject.yml pins the failing task; this also pins the operator-facing
-  # reason the refusal states.
+- name: Assert the final attachment converge reports no change
   ansible.builtin.assert:
-    that: "'no containerd AppArmor profile render is bundled for k3s v1.37.0+k3s1' in k3sb_run.stdout"
+    that: k3sb_run is not changed

@@ -416,15 +416,15 @@
     - name: Check the readiness negatives
       ansible.builtin.include_tasks: tasks/readiness.yml
 
-- name: Verify the containerd AppArmor profile override
+- name: Verify the embedded runc AppArmor attachment
   hosts: localhost
   connection: local
   gather_facts: false
   vars_files: [../shared/vars/module_vars.yml]
   vars:
     k3sb_instance: "{{ groups['all'] | first }}"
-    k3sb_apparmor_profile: /etc/apparmor.d/cri-containerd.apparmor.d
-    k3sb_apparmor_unit: /etc/systemd/system/k3s-bootstrap-apparmor.service
+    k3sb_apparmor_profile: /etc/apparmor.d/k3s-bootstrap-runc
+    k3sb_apparmor_disable_link: /etc/apparmor.d/disable/runc
   tasks:
-    - name: Check the containerd AppArmor profile override end to end
+    - name: Check the embedded runc AppArmor attachment end to end
       ansible.builtin.include_tasks: tasks/apparmor.yml

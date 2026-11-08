@@ -326,7 +326,7 @@ run "passes_extra_packages_to_playbook" {
   }
 }
 
-# --- apparmor_container_profile_fix --------------------------------------
+# --- released runc attachment fix interface -------------------------------
 
 run "accepts_default_apparmor_fix_as_true" {
   command = plan

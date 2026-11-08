@@ -21,7 +21,7 @@
         fail_msg: The k3s play needs the preflight play of the same run (do not skip the preflight tag).
 
     # Must run before k3s starts; why and how: tasks/apparmor/main.yml.
-    - name: Converge the containerd AppArmor profile override
+    - name: Converge the k3s runc AppArmor attachment
       ansible.builtin.include_tasks: apparmor/main.yml
 
     - name: Resolve the kubeconfig group of a server

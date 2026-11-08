@@ -1,8 +1,8 @@
 # Role `k3s`
 
 Installs the pinned k3s for one node type with a module-owned unit and
-`/etc/rancher/k3s/config.yaml`, preloads the patched containerd AppArmor
-profile, starts k3s within `readiness_timeout` and writes the completion
+`/etc/rancher/k3s/config.yaml`, extends the distro runc AppArmor attachment
+to k3s's embedded runc, starts k3s within `readiness_timeout` and writes the completion
 marker `/var/lib/k3s-bootstrap/installed` (the node type) last. `initial`
 gets `cluster-init`; `server` and `agent` join through the head.
 
@@ -25,32 +25,8 @@ gets `cluster-init`; `server` and `agent` join through the head.
   converge, replacing manual edits; operator settings belong in
   `config.yaml.d/` and unit drop-ins, which the role never writes (README,
   operator duties).
-- AppArmor override (`tasks/apparmor/`; LP #2172422,
-  `apparmor_container_profile_fix`, default
-  on, only on a kernel that runs AppArmor): installs
-  `/etc/apparmor.d/cri-containerd.apparmor.d`, the bundled containerd's
-  default profile (`k3s_apparmor_sources` in `vars/main.yml` maps the k3s
-  minor line to the k3s-io/containerd tag it was rendered from, plus the
-  stacked-peer signal and ptrace rules of containerd PR #14487). containerd
-  only loads its built-in copy when no profile of that name is loaded yet,
-  so the preloaded one survives and is used. The render is validated with
-  `apparmor_parser -QTK` before it replaces the file (a syntax error fails
-  the run with nothing loaded or installed). The loaded policy is then
-  reconciled from host state, with no handler: the stamp
-  `/var/lib/k3s-bootstrap/apparmor-loaded` records the checksum of the file
-  whose load completed, and a missing or differing stamp (first run,
-  changed render, or a rollout interrupted between the file and its load)
-  runs `apparmor_parser -r -W`, so an unchanged re-run changes nothing and
-  a lost reload is repeated by the next run. The oneshot unit
-  `k3s-bootstrap-apparmor.service` (`After=apparmor.service`, `Before=` and
-  `WantedBy=` the node's k3s unit) reloads the profile on every boot. A k3s
-  pin whose minor line has no bundled render is refused instead of
-  installing a profile from a mismatched containerd. With the input off or
-  AppArmor off, the profile, unit and stamp files are removed; a loaded
-  profile stays in the kernel (the policy is never unloaded under live
-  containers; see the module README for the rollback procedure), and pods
-  may need recreation to pick up a changed profile. The override becomes
-  redundant once k3s ships a containerd that includes PR #14487.
+- AppArmor (`tasks/apparmor/`): see [runc attachment](#runc-apparmor-attachment)
+  below. No containerd default policy is supplied or k3s minor-line mapping required.
 - The service is reconciled from host state alone, with no handler of its
   own: an inactive unit is started; an active one is restarted when the
   config, a `config.yaml.d` fragment, the unit, the binary or the join token
@@ -60,6 +36,120 @@ gets `cluster-init`; `server` and `agent` join through the head.
   new InvocationID. The wait stops at a wall-clock deadline and fails with
   the journal tail.
 - Skipped inside Docker containers (AGENTS.md, documented exception).
+
+## Runc AppArmor attachment
+
+`apparmor_container_profile_fix` keeps its released name and defaults to
+`true`. A plain `unconfined` embedded runc on restricted Ubuntu kernels
+cannot change_onexec into containerd's default profile without stacking
+`unconfined`. Besides breaking signals, that stack can attach container
+executables in runtime-profiled containers to unrelated host profiles (for example `wg-quick`), breaking
+arbitrary images. Extra containerd signal/ptrace allows do not fix this.
+
+The role reads `/etc/apparmor.d/runc` and renders its contents unchanged
+except for the attachment declaration into its own
+`/etc/apparmor.d/k3s-bootstrap-runc`:
+
+```text
+profile runc /{usr/{bin,sbin},var/lib/rancher/k3s/data/*/bin}/runc flags=(unconfined) {
+```
+
+The profile **name stays `runc`**, as containerd allows receiving signals
+from `peer=runc`. The distro conffile is never edited. The native ABI,
+tunables, permissions and `include if exists <local/runc>` survive: the
+Ubuntu 26.04 `apparmor` 5.0.2 profile uses ABI 5.0, `userns,` and
+`@{exec_path} mr,`; Debian 13's 4.1.0-1 package ships `runc` with ABI 4.0,
+`userns,` and no exec mmap rule. Deriving from the host avoids substituting
+one distro's policy for the other's. An unexpected declaration fails
+closed before migration or any other AppArmor host change. The role also
+asserts `apparmor.service` is persistently enabled before migration.
+Distro policy updates are incorporated on the next converge, not
+automatically copied during a package upgrade.
+
+Before installing, `template.validate` runs `apparmor_parser -QTK` on the
+render. The role then creates `/etc/apparmor.d/disable/runc` pointing to
+`/etc/apparmor.d/runc` and replaces the loaded policy using
+`apparmor_parser -r -W` before k3s starts. The checksum stamp
+`/var/lib/k3s-bootstrap/apparmor-runc-loaded` is written only after success.
+A missing/different stamp, a changed file, a newly restored disable marker
+or absence of `runc.*` in the kernel's securityfs policy directory forces a
+reload even when the installed file was unchanged: interrupted activation
+is retried, while unchanged converges report no change. The stamp is not a
+continuous audit of out-of-band policy content changes under an existing name.
+
+### Reload and package-upgrade guarantees
+
+Verified against the actual Ubuntu 26.04 package files:
+
+- `/lib/apparmor/rc.apparmor.functions::parse_profiles` loads the directory
+  with `apparmor_parser --replace -- /etc/apparmor.d`.
+- `/var/lib/dpkg/info/apparmor.postinst` sources those functions and runs
+  `parse_profiles reload` on configure. Its `dh_apparmor` snippets use
+  direct `apparmor_parser -r -T -W <profile>` invocations.
+- AppArmor 5.0.2 `parser/parser_main.c::process_profile` calls
+  `test_for_dir_mode(basename, "disable")` before parsing/loading, even
+  for an explicitly named file. A readable `disable/runc` marker skips
+  stock `runc`, while our different filename is loaded. The container
+  matrix pins this contract against both supported distro parsers; the
+  VM verifier checks a service reload and a direct package-style invocation
+  leave our loaded runc sha256 unchanged.
+- `apparmor.service` has `DefaultDependencies=no`, `Before=sysinit.target`
+  and `WantedBy=sysinit.target`. The module's k3s/k3s-agent units retain
+  normal systemd dependencies (after sysinit); the standard boot loader
+  therefore loads our file before k3s. No extra loader unit is needed.
+
+The role checks enablement of the standard AppArmor service; these guarantees
+still depend on the standard parser and a successful boot-time policy load.
+Manual parser mode overrides or a failed boot-time policy load are not
+hidden by a second loader.
+
+### Gating, rollback and migration
+
+The kernel's `/sys/module/apparmor/parameters/enabled` must report `Y`,
+and the distro runc file must exist. A missing file with
+`kernel.apparmor_restrict_unprivileged_unconfined=1` fails clearly (restore
+the distro `apparmor` package's policy and rerun). With no such restriction
+the missing-file case skips activation and removes our artifacts; the
+role does not invent a standalone policy on stripped-down Debian images.
+Both supported full distro packages ship the file.
+
+Rollback ownership requires our profile file or stamp to exist; an
+operator's `disable/runc` symlink alone is not module state and is left alone.
+For module-managed state, input `false` first records `restore-stock` in
+the stamp, then removes our file and the disable symlink, replaces the loaded `runc` with
+`/etc/apparmor.d/runc` and removes the stamp only after success. The pending
+intent makes rollback retryable even if activation loaded the policy but
+never wrote its completed-load stamp. With AppArmor off, files are removed
+but loading is impossible; the stock file loads on the next AppArmor-enabled
+boot. If stock is absent there is nothing to reload: no profile is unloaded.
+
+`migrate.yml` disables/stops/removes the v0.3.1 oneshot loader, deletes
+`/etc/apparmor.d/cri-containerd.apparmor.d` and its old `apparmor-loaded`
+stamp, regardless of the input. It **does not unload or replace** the
+already loaded containerd policy under live containers: its extra allow
+rules remain harmlessly loaded and containerd reuses that policy until
+reboot. After reboot containerd loads its own default again. Recreate
+affected pods after enabling this fix; existing stacked labels do not
+automatically become plain labels. No automatic workload restart is done.
+
+### Security trade-off
+
+Processes runc starts without their own profile change (pause containers,
+privileged pods and `appArmorProfile: Unconfined` pods) can now run under
+the named, `flags=(unconfined)` **`runc` profile, including its `userns`
+allow**, rather than plain `unconfined`. This extends exactly the treatment
+Ubuntu already gives its packaged `/usr/bin/runc` to k3s's embedded runc;
+it is not additional container confinement. The attachment is limited to
+the distro runc paths and the module-supported k3s data path. No host
+restriction sysctl is changed. Rollback restores future attachments but
+does not retroactively relabel live processes. Never use `apparmor_parser
+-R` under live containers.
+
+These runc-labelled workloads retain **unconfined-style exec attachment
+into host profiles** (`profile_unconfined` → `find_attach` in the kernel's
+AppArmor `domain.c`). Only containers that change to a runtime profile,
+such as RuntimeDefault, gain protection from those unintended host-profile
+transitions by removing the plain-unconfined stack member.
 
 ## Dependencies
 

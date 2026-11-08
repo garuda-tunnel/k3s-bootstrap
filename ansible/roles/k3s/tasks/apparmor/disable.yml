@@ -1,39 +1,57 @@
 ---
-# The disable path of apparmor/main.yml: the input is off or the kernel
-# runs no AppArmor; the module owns the files, so it removes them. A
-# loaded profile stays in the kernel until its policy is reloaded:
-# unloading it under live containers would strip their confinement.
-- name: Check whether the profile loader unit is installed
+- name: Check for managed runc artifacts and a pending restoration
   ansible.builtin.stat:
-    path: "{{ k3s_apparmor_unit }}"
+    path: "{{ item }}"
     get_checksum: false
-  register: k3s_apparmor_unit_file
+  loop:
+    - "{{ k3s_apparmor_profile }}"
+    - "{{ k3s_apparmor_loaded_stamp }}"
+  register: k3s_apparmor_restore_artifacts
 
-- name: Disable the profile loader unit
-  ansible.builtin.systemd_service:
-    name: "{{ k3s_apparmor_unit | basename }}"
-    enabled: false
-    daemon_reload: true
-  when: k3s_apparmor_unit_file.stat.exists
+- name: Note whether stock policy restoration is pending
+  ansible.builtin.set_fact:
+    k3s_apparmor_restore_needed: >-
+      {{ k3s_apparmor_restore_artifacts.results | selectattr('stat.exists') | list | length > 0 }}
 
-- name: Remove the profile loader unit
+- name: Create the state directory for a pending restoration
   ansible.builtin.file:
-    path: "{{ k3s_apparmor_unit }}"
-    state: absent
+    path: "{{ k3s_apparmor_loaded_stamp | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when: k3s_apparmor_restore_needed | bool
 
-- name: Remove the containerd default profile override
+- name: Record pending stock restoration before removing files
+  # Activation may have loaded runc but died before writing its stamp.
+  # Persist intent first so rollback is retryable even in that case.
+  ansible.builtin.copy:
+    content: "restore-stock\n"
+    dest: "{{ k3s_apparmor_loaded_stamp }}"
+    owner: root
+    group: root
+    mode: '0644'
+  when: k3s_apparmor_restore_needed | bool
+
+- name: Remove the extended runc profile and distro disable marker
   ansible.builtin.file:
-    path: "{{ k3s_apparmor_profile }}"
+    path: "{{ item }}"
     state: absent
+  loop: ["{{ k3s_apparmor_profile }}", "{{ k3s_apparmor_disable_link }}"]
+  when: k3s_apparmor_restore_needed | bool
 
-- name: Remove the stamp of the last completed load
-  # Leaving it would let a later re-enable skip the load although
-  # the kernel no longer runs this module's policy.
+- name: Replace the loaded runc policy with the distro profile
+  # Keep the stamp until success so an interrupted rollback is retried.
+  # No parser can load policy when the kernel has AppArmor disabled.
+  ansible.builtin.command:
+    argv: [/usr/sbin/apparmor_parser, -r, "{{ k3s_apparmor_distro_profile }}"]
+  when:
+    - k3s_apparmor_enabled | bool
+    - k3s_apparmor_distro.stat.exists
+    - k3s_apparmor_restore_needed | bool
+  changed_when: true
+
+- name: Remove the runc load stamp after stock restoration
   ansible.builtin.file:
     path: "{{ k3s_apparmor_loaded_stamp }}"
     state: absent
-
-- name: Reload systemd after the unit removal
-  ansible.builtin.systemd_service:
-    daemon_reload: true
-  when: k3s_apparmor_unit_file.stat.exists

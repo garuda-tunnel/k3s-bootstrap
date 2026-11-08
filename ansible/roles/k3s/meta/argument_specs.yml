@@ -45,9 +45,14 @@ argument_specs:
         required: true
       apparmor_container_profile_fix:
         description: >-
-          Preload the containerd default AppArmor profile with stacked-peer
-          signal and ptrace rules for LP 2172422; applied only when the
-          kernel runs AppArmor.
+          Extend the distro runc AppArmor attachment to k3s's embedded runc,
+          preventing forced unconfined stacking and unintended host-profile
+          attachments for containers using a runtime profile (LP 2172422).
+          Workloads without a profile change can inherit runc, including userns
+          permission and unconfined-style exec attachment into host profiles.
+          Requires AppArmor and its boot service enabled and a distro runc
+          profile; missing policy fails on restricted kernels. False restores
+          module-managed nodes to stock without unloading live profiles.
         type: bool
         required: true
       readiness_timeout:

@@ -1,14 +1,6 @@
 ---
-# Dispatched from tasks/main.yml before k3s starts. Ubuntu 7.0.0-41+
-# kernels (the CVE-2026-90231 backport, LP #2172422) stack the container
-# label as cri-containerd.apparmor.d//&unconfined, which containerd's
-# built-in profile does not allow as a signal/ptrace peer: processes in
-# the same pod can no longer signal each other (gosu hangs, pg_ctl cannot
-# stop, SIGURG denials). The fix preloads the bundled containerd's own
-# default profile plus the stacked-peer rules of containerd PR #14487:
-# containerd loads its built-in copy only when no profile of that name is
-# loaded yet, so a preloaded profile survives and is used. Full story and
-# rollback: the role README.
+# Attach embedded runc before k3s starts: named runc can change_onexec
+# without forced stacking with unconfined (LP #2172422). See role README.
 - name: Check whether the kernel exposes its AppArmor enablement
   ansible.builtin.stat:
     path: /sys/module/apparmor/parameters/enabled
@@ -27,10 +19,80 @@
       {{ k3s_apparmor_parameter.stat.exists
          and (k3s_apparmor_flag.content | default('') | b64decode | trim) == 'Y' }}
 
-- name: Preload the patched containerd AppArmor profile
-  ansible.builtin.include_tasks: enable.yml
-  when: apparmor_container_profile_fix | bool and k3s_apparmor_enabled | bool
+- name: Check for the distro runc profile
+  ansible.builtin.stat:
+    path: "{{ k3s_apparmor_distro_profile }}"
+    get_checksum: false
+  register: k3s_apparmor_distro
 
-- name: Remove the containerd AppArmor profile override
+- name: Check whether the kernel exposes its unconfined restriction
+  ansible.builtin.stat:
+    path: /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined
+    get_checksum: false
+  register: k3s_apparmor_restriction_parameter
+
+- name: Read the kernel unconfined restriction
+  ansible.builtin.slurp:
+    src: /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined
+  register: k3s_apparmor_restriction
+  when: k3s_apparmor_restriction_parameter.stat.exists
+
+- name: Refuse restricted unconfined without a distro runc profile
+  ansible.builtin.assert:
+    that: k3s_apparmor_distro.stat.exists
+    fail_msg: >-
+      kernel.apparmor_restrict_unprivileged_unconfined=1 but
+      /etc/apparmor.d/runc is missing. Install or restore the distro
+      apparmor package's runc profile and re-run; k3s would otherwise
+      create stacked container labels. No host restriction sysctl is changed.
+  when:
+    - apparmor_container_profile_fix | bool and k3s_apparmor_enabled | bool
+    - k3s_apparmor_restriction.content | default('') | b64decode | trim == '1'
+
+- name: Validate the distro policy and its boot loader before changing host state
+  when:
+    - apparmor_container_profile_fix | bool and k3s_apparmor_enabled | bool
+    - k3s_apparmor_distro.stat.exists
+  block:
+    - name: Read the distro runc policy
+      ansible.builtin.slurp:
+        src: "{{ k3s_apparmor_distro_profile }}"
+      register: k3s_apparmor_stock
+
+    - name: Require the supported distro runc attachment
+      ansible.builtin.assert:
+        that: >-
+          (k3s_apparmor_stock.content | b64decode
+           | regex_findall(k3s_apparmor_distro_declaration)) | length == 1
+        fail_msg: >-
+          /etc/apparmor.d/runc has an unsupported profile declaration.
+          Restore the distro profile or update the k3s-bootstrap attachment
+          transformation before enabling apparmor_container_profile_fix.
+
+    - name: Read the AppArmor service boot enablement
+      community.general.systemd_info:
+        unitname: [apparmor.service]
+      register: k3s_apparmor_service
+
+    - name: Require persistent AppArmor boot loading
+      ansible.builtin.assert:
+        that: >-
+          k3s_apparmor_service.units.get('apparmor.service', {}).get('unitfilestate', '') == 'enabled'
+        fail_msg: >-
+          apparmor.service must be enabled for apparmor_container_profile_fix;
+          enable the distro service so runc policy loads before k3s at boot.
+
+- name: Migrate the v0.3.1 containerd profile override
+  ansible.builtin.include_tasks: migrate.yml
+
+- name: Extend the distro runc attachment to k3s
+  ansible.builtin.include_tasks: enable.yml
+  when:
+    - apparmor_container_profile_fix | bool and k3s_apparmor_enabled | bool
+    - k3s_apparmor_distro.stat.exists
+
+- name: Restore the stock runc attachment
   ansible.builtin.include_tasks: disable.yml
-  when: not (apparmor_container_profile_fix | bool and k3s_apparmor_enabled | bool)
+  when: >-
+    not (apparmor_container_profile_fix | bool and k3s_apparmor_enabled | bool
+         and k3s_apparmor_distro.stat.exists)

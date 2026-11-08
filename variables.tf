@@ -233,7 +233,7 @@ variable "grow_root_filesystem" {
 }
 
 variable "apparmor_container_profile_fix" {
-  description = "Preload the containerd default AppArmor profile (/etc/apparmor.d/cri-containerd.apparmor.d: the bundled containerd's template plus the stacked-peer signal and ptrace rules of containerd PR #14487) so processes inside a pod can signal each other on Ubuntu kernels that stack the container label as <profile>//&unconfined (LP #2172422, CVE-2026-90231). Only applied on hosts whose kernel runs AppArmor; the extra allow rules are harmless where the stacked label never appears. A k3s pin without a bundled profile render is refused while this is enabled."
+  description = "Extend the distro runc AppArmor profile attachment to k3s's embedded runc, using a module-owned file and disabling (not editing) the distro file. For containers using a runtime profile, prevents forced unconfined stacking, broken intra-pod signals and unintended host-profile attachments on restricted Ubuntu kernels (LP #2172422). Requires AppArmor enabled, its boot service enabled and /etc/apparmor.d/runc present; missing stock policy fails on a restricted kernel. Pause, privileged and explicitly Unconfined workloads can inherit the named runc profile, including userns permission and unconfined-style exec attachment into host profiles. No host restriction sysctl is changed. False restores module-managed nodes to the distro attachment without unloading live policy."
   type        = bool
   default     = true
   nullable    = false

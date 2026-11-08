@@ -9,11 +9,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 # nftables lets the existing-firewall test reach that refusal, not the missing-nft guard.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        systemd systemd-sysv openssh-server sudo python3 kmod nftables \
+        systemd systemd-sysv openssh-server sudo python3 kmod nftables apparmor \
     && rm -rf /var/lib/apt/lists/*
 
+# Parser tests must never load policy into the privileged fixture's shared kernel.
 # Start sshd directly on port 22, not via socket activation.
-RUN systemctl enable ssh.service \
+RUN systemctl mask apparmor.service \
+    && systemctl enable ssh.service \
     && (systemctl disable ssh.socket || true) \
     && mkdir -p /run/sshd
 

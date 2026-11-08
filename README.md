@@ -145,60 +145,56 @@ an initialised server; enabled ufw or firewalld with `firewall_mode =
 `nft destroy table inet k3s_bootstrap`, delete the unit and
 `/etc/k3s-bootstrap/firewall.nft`, `systemctl daemon-reload`).
 
-The k3s play refuses a `k3s_version` whose minor line (the `x.y` of the
-pin) has no bundled containerd AppArmor profile render while
-`apparmor_container_profile_fix` is enabled (the default): a profile
-rendered from a different containerd could drift from what the bundled
-containerd expects. Set the input to `false` or extend the mapping in
-`ansible/roles/k3s/vars/main.yml`.
+The k3s play also refuses a missing distro `/etc/apparmor.d/runc` when
+AppArmor and `apparmor_container_profile_fix` are enabled and
+`kernel.apparmor_restrict_unprivileged_unconfined=1`, or an unsupported
+distro runc profile declaration. Restore the distro policy and rerun.
 
-## AppArmor intra-pod signals (Ubuntu kernels)
+## AppArmor embedded runc attachment
 
-Ubuntu kernels 7.0.0-41 and later (the CVE-2026-90231 backport,
-[LP #2172422](https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2172422))
-stack the AppArmor label of a container as
-`cri-containerd.apparmor.d//&unconfined`, a peer containerd's built-in
-profile does not allow: processes in the same pod can no longer signal each
-other (gosu hangs, `pg_ctl` cannot stop postgres, SIGURG/SIGTERM denials in
-dmesg). With `apparmor_container_profile_fix = true` (default) on a host
-whose kernel runs AppArmor, the module preloads
-`/etc/apparmor.d/cri-containerd.apparmor.d` — the bundled containerd's own
-default profile plus the stacked-peer rules of
-[containerd PR #14487](https://github.com/containerd/containerd/pull/14487)
-— validates the render with `apparmor_parser -QTK` before the file is
-replaced, reconciles the loaded policy from host state (an interrupted
-rollout is repaired by the next run) and reloads it on every boot
-(`k3s-bootstrap-apparmor.service`,
-`After=apparmor.service`, `Before=k3s`). containerd keeps the preloaded
-profile: it only loads its built-in copy when no profile of that name is
-loaded yet.
+On Ubuntu kernels 7.0.0-41 and later with unconfined restrictions
+([LP #2172422](https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2172422)),
+k3s's embedded runc does not match the distro's `/usr/{bin,sbin}/runc`
+attachment. Running as plain `unconfined`, it produces the stacked label
+`cri-containerd.apparmor.d//&unconfined`: intra-pod signals fail, and
+executables inside runtime-profiled containers can attach to unrelated **host** profiles
+(`wg-quick`, routing daemons, `locale`, or any other matching path).
+The v0.3.1 containerd signal/ptrace patch fixed only the first symptom.
 
-- The default is `true` because the extra allow rules only ever match the
-  stacked label: on unaffected kernels and on Debian hosts (no forced
-  stacking) they are inert. The trade-off: upgrading to a k3s minor line
-  the module does not map yet fails the run until the module is updated or
-  the input is set to `false`.
-- A pod keeps the label it was created with: after enabling (or changing)
-  the profile, recreate the affected pods (for example
-  `kubectl rollout restart`) to pick up the corrected behaviour.
-- Turning the input off removes the installed files but not the loaded
-  policy: a loaded profile stays in the kernel until it is replaced or the
-  node reboots. An AppArmor policy reload over the files present
-  (`rc.apparmor.functions`, `apparmor_parser --replace`) does not remove a
-  fileless loaded profile, and containerd's load-once check keeps whatever
-  is loaded, so a node keeps running this override after the files are
-  gone and nodes can be mixed: rebooted ones run containerd's built-in
-  copy again, non-rebooted ones keep the override. To roll the override
-  back on a live node, either reboot it, or replace the policy with
-  containerd's built-in profile rendered from the same template without
-  the two stacked-peer lines
-  (`apparmor_parser -r <unpatched-render>`), then recreate the pods so
-  they pick up the corrected label. Never unload the profile
-  (`apparmor_parser -R`) under live containers: it would strip their
-  confinement.
-- The override becomes redundant once k3s ships a containerd that includes
-  PR #14487; watch the k3s release notes for the containerd bump and then
-  set the input to `false`.
+`apparmor_container_profile_fix = true` (default; released input name
+unchanged) installs `/etc/apparmor.d/k3s-bootstrap-runc`, defining **`runc`**
+with the distro's native policy and an attachment covering both distro
+paths and `/var/lib/rancher/k3s/data/*/bin/runc`. A standard disable symlink
+prevents the untouched distro file from replacing ours on boot, reload
+or package upgrade. The render is parser-validated before writing, loaded
+before k3s starts, and reconciled using a completed-load checksum stamp.
+The role requires the standard AppArmor service to be enabled; it loads
+the policy on later boots. Missing loaded runc policy also forces reconciliation.
+No extra loader or
+k3s minor-line mapping is needed. Ubuntu 26.04 and Debian 13 both ship the
+base runc profile. Missing stock policy without unconfined restrictions
+skips the fix; a restricted kernel fails rather than silently proceeding.
+
+**Security trade-off:** pause, privileged and `appArmorProfile: Unconfined`
+workloads that do not change profile can now inherit the named
+`flags=(unconfined)` **`runc` profile, including its `userns` allow**, instead
+of plain `unconfined`. This is exactly the treatment Ubuntu already gives
+its packaged `/usr/bin/runc`, extended to k3s's embedded binary. No host
+restriction sysctl is changed; this is not additional container confinement.
+These **runc-labelled workloads retain unconfined-style exec attachment into
+host profiles**. Preventing those transitions applies only to containers
+that change to a runtime profile, such as RuntimeDefault.
+
+Recreate affected pods after rollout: existing stacked labels remain.
+On module-managed nodes, setting the input to `false` removes our file and the disable symlink,
+then reloads the distro `runc` policy without unloading any profile.
+An operator-made disable symlink alone, without our profile or stamp, is untouched.
+With AppArmor off, only file cleanup is possible; stock loads on the next
+AppArmor-enabled boot. Migration removes all v0.3.1 files, stamp and loader
+unit but **leaves its already-loaded containerd policy alone**: containerd
+reuses it until reboot, when its built-in default returns. Never unload a
+profile under live containers. Implementation, distro/reload evidence,
+rollback details and limitations: [k3s role README](ansible/roles/k3s/README.md#runc-apparmor-attachment).
 
 ## Inputs and outputs
 
@@ -214,7 +210,7 @@ its data safety (`data-dir`, `datastore-endpoint`, `cluster-reset`,
 | Optional input | Type | Default | Description |
 |---|---|---|---|
 | `extra_packages` | `list(string)` | `[]` | Additional apt packages to install (`state: present`, never removed by the module). Each name must match `^[a-z0-9][a-z0-9+.-]+$`. Listing `qemu-guest-agent` also enables and starts its service. |
-| `apparmor_container_profile_fix` | `bool` | `true` | Preload the bundled containerd's default AppArmor profile with the stacked-peer signal and ptrace rules of containerd PR #14487, so intra-pod signals work on Ubuntu kernels affected by LP #2172422 (see [AppArmor intra-pod signals](#apparmor-intra-pod-signals-ubuntu-kernels)). Only applied on hosts whose kernel runs AppArmor; refused for a k3s minor line without a bundled profile render. |
+| `apparmor_container_profile_fix` | `bool` | `true` | Extend the distro `runc` attachment to embedded runc, preventing forced stacking and unintended host-profile transitions for runtime-profiled containers. Unprofiled workloads can inherit `runc`, including `userns` permission and unconfined-style exec attachment into host profiles. Requires AppArmor, its boot service enabled and the distro runc file (missing policy fails on restricted kernels). False restores module-managed nodes to stock without unloading live policy. See [AppArmor attachment](#apparmor-embedded-runc-attachment). |
 
 Outputs, all null on agents and available once the node is ready: `head`
 (this node's SSH coordinates, for `head = module.<name>.head`),
@@ -227,8 +223,8 @@ primary group, which must be private or admin-only) and
 | Tier | What it proves | Needs | Command (repository root) |
 |---|---|---|---|
 | `tofu test` | plan-time interface: input validation, outputs, re-run trigger | OpenTofu | `tofu test` |
-| controller | the `inventory` role, role documentation, launch parity, run hash; no host | `uv` venv | `.venv/bin/pytest tests/controller` |
-| container | preflight, access, SSH hardening, host refusals and a full module apply/re-apply against systemd containers; no k3s | privileged Docker, OpenTofu, `uv` venv | `.venv/bin/pytest -v tests/container` |
+| controller | inventory, role documentation, AppArmor policy transformation/preflight/reconcile/ownership, launch parity, run hash; no host | `uv` venv | `.venv/bin/pytest tests/controller` |
+| container | preflight, access, SSH hardening, host refusals, native AppArmor parsing and full module apply/re-apply against systemd containers; no k3s | privileged Docker, OpenTofu, `uv` venv | `.venv/bin/pytest -v tests/container` |
 | molecule | role behaviour on real VMs: `default`, `host`, `cluster`, `firewall`, `recovery` | libvirt, Vagrant, activated venv | `molecule test -s <scenario>` |
 | `tests/vm` | module contracts with real `tofu apply` on Vagrant VMs | libvirt, Vagrant, `K3SB_VM_TESTS=1` | `pytest -s tests/vm` |
 

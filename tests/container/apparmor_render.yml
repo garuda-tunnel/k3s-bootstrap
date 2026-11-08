@@ -1,0 +1,91 @@
+---
+# Parser-only contract: never load policy into the Docker host's kernel.
+- name: Register the inventory
+  ansible.builtin.import_playbook: ../../ansible/k3s-node.yml
+
+- name: Verify the distro policy transformation and disable marker contract
+  hosts: k3s_node
+  gather_facts: false
+  tags: always
+  vars:
+    k3sb_parser_dir: /var/tmp/k3sb-apparmor-parser-test
+  tasks:
+    - name: Read the production attachment declaration
+      ansible.builtin.include_vars: ../../ansible/roles/k3s/vars/main.yml
+
+    - name: Use the bootstrap connection without running access
+      ansible.builtin.set_fact:
+        ansible_user: "{{ hostvars['localhost'].inventory_connection_user }}"
+
+    - name: Check the real distro policy with the real parser without loading
+      block:
+        - name: Read the distro runc profile
+          ansible.builtin.slurp:
+            src: /etc/apparmor.d/runc
+          register: k3s_apparmor_stock
+
+        - name: Create an isolated parser disable directory
+          ansible.builtin.file:
+            path: "{{ k3sb_parser_dir }}/disable"
+            state: directory
+            mode: '0700'
+
+        - name: Render the production attachment transformation
+          ansible.builtin.template:
+            src: ../../ansible/roles/k3s/templates/apparmor/runc.j2
+            dest: "{{ k3sb_parser_dir }}/k3s-bootstrap-runc"
+            mode: '0600'
+            validate: /usr/sbin/apparmor_parser -QTK %s
+
+        - name: Copy stock to the isolated directory
+          ansible.builtin.copy:
+            content: "{{ k3s_apparmor_stock.content | b64decode }}"
+            dest: "{{ k3sb_parser_dir }}/runc"
+            mode: '0600'
+
+        - name: Disable stock in the isolated parser directory
+          ansible.builtin.file:
+            src: "{{ k3sb_parser_dir }}/runc"
+            dest: "{{ k3sb_parser_dir }}/disable/runc"
+            state: link
+
+        - name: Read profile names through directory and explicit-file parser paths
+          ansible.builtin.command:
+            argv:
+              - /usr/sbin/apparmor_parser
+              - -QTK
+              - -N
+              - -b
+              - "{{ k3sb_parser_dir }}"
+              - -I
+              - /etc/apparmor.d
+              - "{{ item }}"
+          loop: ["{{ k3sb_parser_dir }}", "{{ k3sb_parser_dir }}/runc"]
+          changed_when: false
+          register: k3sb_parser_names
+
+        - name: Assert directory reload sees only our runc and direct stock parsing skips it
+          ansible.builtin.assert:
+            that:
+              - k3sb_parser_names.results[0].stdout | trim == 'runc'
+              - k3sb_parser_names.results[1].stdout | trim == ''
+
+        - name: Remove the disable marker to restore stock
+          ansible.builtin.file:
+            path: "{{ k3sb_parser_dir }}/disable/runc"
+            state: absent
+
+        - name: Parse stock again after restoring its attachment
+          ansible.builtin.command:
+            argv: [/usr/sbin/apparmor_parser, -QTK, -N, -b, "{{ k3sb_parser_dir }}", -I, /etc/apparmor.d, "{{ k3sb_parser_dir }}/runc"]
+          changed_when: false
+          register: k3sb_stock_names
+
+        - name: Assert stock is no longer skipped
+          ansible.builtin.assert:
+            that: k3sb_stock_names.stdout | trim == 'runc'
+      always:
+        - name: Remove the isolated parser fixtures
+          ansible.builtin.file:
+            path: "{{ k3sb_parser_dir }}"
+            state: absent

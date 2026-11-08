@@ -1,27 +1,6 @@
 ---
 # The enable path of apparmor/main.yml: the input is on and the kernel
-# runs AppArmor.
-- name: Resolve the bundled containerd profile render for this k3s
-  # The pin's minor line (v1.36.5+k3s1 -> 1.36) keys the render table.
-  # Slicing, not a regex backref: a Jinja string literal would read
-  # '\1' as the octal escape \x01, not as a group reference.
-  vars:
-    k3s_apparmor_minor: "{{ (k3s_version[1:] | split('.') | list)[:2] | join('.') }}"
-  ansible.builtin.set_fact:
-    k3s_apparmor_source: >-
-      {{ k3s_apparmor_sources[k3s_apparmor_minor] | default(none) }}
-
-- name: Refuse a k3s pin without a bundled profile render
-  # A profile rendered from a different containerd could silently
-  # drift from what the bundled containerd expects.
-  ansible.builtin.assert:
-    that: k3s_apparmor_source is not none
-    fail_msg: >-
-      apparmor_container_profile_fix is enabled but no containerd AppArmor
-      profile render is bundled for k3s {{ k3s_version }}. Set
-      apparmor_container_profile_fix = false or extend k3s_apparmor_sources
-      in ansible/roles/k3s/vars/main.yml with the render of the containerd
-      this k3s bundles.
+# runs AppArmor with the distro runc file present and validated.
 
 - name: Check for the AppArmor userspace
   ansible.builtin.stat:
@@ -46,18 +25,34 @@
     group: root
     mode: '0755'
 
-- name: Install the containerd default profile override
+- name: Install the extended runc profile
   # validate parses the render before it replaces the file, so an
   # invalid profile never lands on disk (as the firewall role does
   # with nft -c).
   ansible.builtin.template:
-    src: "{{ k3s_apparmor_source.template }}"
+    src: apparmor/runc.j2
     dest: "{{ k3s_apparmor_profile }}"
     owner: root
     group: root
     mode: '0644'
     validate: /usr/sbin/apparmor_parser -QTK %s
   register: k3s_apparmor_override
+
+- name: Create the distro profile disable directory
+  ansible.builtin.file:
+    path: "{{ k3s_apparmor_disable_link | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Disable the distro file so only our runc definition loads
+  ansible.builtin.file:
+    src: "{{ k3s_apparmor_distro_profile }}"
+    dest: "{{ k3s_apparmor_disable_link }}"
+    state: link
+    follow: false
+  register: k3s_apparmor_distro_disabled
 
 - name: Check for the stamp of the last completed load
   ansible.builtin.stat:
@@ -71,26 +66,29 @@
   register: k3s_apparmor_stamp
   when: k3s_apparmor_stamp_file.stat.exists
 
+- name: Look for runc in the loaded kernel policy
+  ansible.builtin.find:
+    paths: /sys/kernel/security/apparmor/policy/profiles
+    patterns: runc.*
+    file_type: directory
+    recurse: false
+  register: k3s_apparmor_loaded_profiles
+
 - name: Note whether the loaded policy must be reconciled
-  # The loaded policy is reconciled from host state, not from this
-  # run's template change: a run interrupted after the file landed
-  # but before its reload leaves the kernel running the old policy
-  # (containerd's built-in render, or an earlier override) under
-  # the same profile name, and an unchanged file would never fire a
-  # change-notified handler again. The stamp holds the checksum of
-  # the exact file whose load completed, so a missing or differing
-  # stamp catches the interrupted rollout, a changed render and a
-  # first install in one comparison, and an unchanged re-run stays
-  # changed=0. The kernel side is not diffable instead: the
-  # securityfs profiles dump lists names and modes only, and the
-  # parser's compiled blob does not hash to the kernel's
-  # per-profile sha256, so the loaded content cannot be matched to
-  # the file without loading it.
+  # Reconcile from host state, not only from this run's template change:
+  # an interrupted run can leave our file on disk but stock runc loaded,
+  # so a stale stamp or no loaded runc also reloads. Restoring a missing
+  # disable marker repairs a possible stock reload. The parser blob hash
+  # cannot be compared to the kernel profile sha256, so loaded content
+  # itself is not audited.
   ansible.builtin.set_fact:
     k3s_apparmor_load_needed: >-
       {{ not (k3s_apparmor_stamp_file.stat.exists | default(false))
          or (k3s_apparmor_stamp.content | default('') | b64decode | trim)
-            != k3s_apparmor_override.checksum }}
+            != k3s_apparmor_override.checksum
+         or k3s_apparmor_distro_disabled is changed
+         or k3s_apparmor_override is changed
+         or k3s_apparmor_loaded_profiles.matched == 0 }}
 
 - name: Replace the loaded profile in place, before k3s starts
   ansible.builtin.command:
@@ -109,19 +107,3 @@
     group: root
     mode: '0644'
   when: k3s_apparmor_load_needed | bool
-
-- name: Install the profile loader unit
-  ansible.builtin.template:
-    src: apparmor/k3s-bootstrap-apparmor.service.j2
-    dest: "{{ k3s_apparmor_unit }}"
-    owner: root
-    group: root
-    mode: '0644'
-
-- name: Enable the profile loader unit
-  # The immediate load of this run is the reconciliation above; the
-  # unit only guarantees the same on every later boot, before k3s.
-  ansible.builtin.systemd_service:
-    name: "{{ k3s_apparmor_unit | basename }}"
-    enabled: true
-    daemon_reload: true

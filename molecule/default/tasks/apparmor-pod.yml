@@ -1,0 +1,45 @@
+---
+# Fresh workload proof: Unconfined exposes inherited runc attachment on every
+# kernel; RuntimeDefault must have no unconfined stack on restricted kernels.
+- name: Verify the requested container process label
+  become: true
+  delegate_to: "{{ k3sb_instance }}"
+  vars:
+    k3sb_probe_name: "k3sb-apparmor-{{ k3sb_apparmor_probe_type | lower }}"
+  block:
+    - name: Start a fresh container with the requested AppArmor setting
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - run
+          - "{{ k3sb_probe_name }}"
+          - --image=docker.io/library/busybox:1.37.0
+          - --restart=Never
+          - "--overrides={{ {'spec': {'securityContext': {'appArmorProfile': {'type': k3sb_apparmor_probe_type}}}} | to_json }}"
+          - --
+          - sleep
+          - '300'
+      changed_when: true
+
+    - name: Wait for the container
+      ansible.builtin.command:
+        argv: [k3s, kubectl, wait, --for=condition=Ready, "pod/{{ k3sb_probe_name }}", --timeout=180s]
+      changed_when: false
+
+    - name: Read the running container init process label
+      ansible.builtin.command:
+        argv: [k3s, kubectl, exec, "{{ k3sb_probe_name }}", --, cat, /proc/1/attr/current]
+      changed_when: false
+      register: k3sb_container_label
+
+    - name: Assert the expected profile label without stacking
+      ansible.builtin.assert:
+        that:
+          - k3sb_container_label.stdout | trim == k3sb_apparmor_expected_label
+          - "'//&' not in k3sb_container_label.stdout"
+  always:
+    - name: Remove the probe pod before another invocation
+      ansible.builtin.command:
+        argv: [k3s, kubectl, delete, pod, "{{ k3sb_probe_name }}", --ignore-not-found, --wait=true, --timeout=60s]
+      changed_when: true

@@ -1,0 +1,3 @@
+{{ k3s_apparmor_stock.content | b64decode
+   | regex_replace(k3s_apparmor_distro_declaration,
+                   'profile runc /{usr/{bin,sbin},var/lib/rancher/k3s/data/*/bin}/runc flags=(unconfined) {') }}

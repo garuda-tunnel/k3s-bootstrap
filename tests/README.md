@@ -11,8 +11,8 @@ uv pip install -r tests/requirements.txt
 | Tier | Scope | Prerequisites | Command (repository root) |
 |---|---|---|---|
 | interface | plan-time inputs and outputs | OpenTofu | `tofu test` |
-| controller | the `inventory` role, role documentation, launch parity, run hash; no host | venv | `.venv/bin/pytest tests/controller` |
-| container | preflight, access, SSH hardening, host refusals and a module apply (no k3s) | Docker, OpenTofu, host kernel modules, venv | `.venv/bin/pytest -v tests/container` |
+| controller | the `inventory` role, role documentation, runc policy transformation, launch parity, run hash; no host | venv | `.venv/bin/pytest tests/controller` |
+| container | preflight, access, SSH hardening, host refusals, native AppArmor parsing and a module apply (no k3s) | Docker, OpenTofu, host kernel modules, venv | `.venv/bin/pytest -v tests/container` |
 | molecule | role behaviour on real VMs | libvirt, Vagrant, venv | see `molecule/README.md` |
 | VM | module contracts on Vagrant VMs | libvirt, Vagrant, venv | see below |
 
@@ -27,7 +27,10 @@ sensitive input, and the re-run trigger. Runs in CI.
 
 pytest with no target host: the `inventory` role (pins, argument spec and input guards,
 registered hostvars, host-key settings), launch parity between `main.tf`
-and both harnesses, the Molecule launch judge, and `run_hash`. Runs in CI:
+and both harnesses, the Molecule launch judge, `run_hash`, and preservation
+of the distro ABI/body when extending the runc attachment, validation before
+migration, kernel/file reconciliation decisions and operator disable-marker
+ownership. Runs in CI:
 `.venv/bin/pytest tests/controller`.
 
 ## Container tier (`container/`)
@@ -42,7 +45,13 @@ controller-side `Inventory` play refuses are tested in the controller tier, not
 here. A second container plays the head for the join
 preflight cases. k3s cannot run in a container, so the `k3s` and
 `readiness` roles skip Docker hosts; they are proven by the molecule and VM
-tiers.
+tiers. `test_apparmor` runs the production runc template against each
+distro's real policy and parser, proving that directory parsing and direct
+package-style parsing skip disabled stock, and removing the marker restores
+stock parsing. It never loads policy (`-QTK` on every parser invocation),
+so the container's shared host kernel is not modified by this check.
+The fixture masks `apparmor.service` to prevent boot-time policy loading
+into that shared kernel; only native userspace parsing is tested here.
 
 Needs privileged Docker, OpenTofu, and `/lib/modules` matching the Docker
 host's running kernel with `br_netfilter` and `overlay` available. The
@@ -69,7 +78,7 @@ the playbook runs in subprocesses.
 
 The session fixtures `systemd_host` (the node) and `head_host` (the head)
 boot the image from `container/Dockerfile` (systemd as PID 1,
-`openssh-server`, `sudo`, `python3`, `kmod`, `nftables`), publish SSH on a
+`openssh-server`, `sudo`, `python3`, `kmod`, `nftables`, `apparmor`), publish SSH on a
 random `127.0.0.1` port and authorize one ephemeral controller key for
 root; nothing of the repository is copied in. `run_playbook()` launches the
 playbook as the module does; `playbook_vars()` builds the inputs a test overrides on top of the valid node inputs
