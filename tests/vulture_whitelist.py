@@ -7,3 +7,4 @@ fixture_module  # unused function: pytest fixture registered under the name "mod
 fixture_controller_key  # unused function: pytest fixture registered under the name "controller_key"
 fixture_child  # unused function: pytest fixture registered under the name "child"
 fixture_apply_host  # unused function: pytest fixture registered under the name "apply_host"
+sandbox  # executed by runpy in the disposable namespace subprocess

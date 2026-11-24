@@ -1,35 +1,44 @@
-{% set trusted_cidrs = api_trusted_cidrs + cluster_cidrs %}
-{% set ipv4_cidrs = trusted_cidrs | reject('search', ':') | list %}
-{% set ipv6_cidrs = trusted_cidrs | select('search', ':') | list %}
+{#- Node trust implies API/etcd trust: a peer cannot function without the
+    API, so peers are listed once, in node_trusted_cidrs. -#}
+{% set api_trusted = api_trusted_cidrs + cluster_cidrs + node_trusted_cidrs %}
+{% set kubelet_trusted = cluster_cidrs + node_trusted_cidrs %}
+{#- One trust tier per gated port group: name, allowed CIDRs, ports, protocol. -#}
+{% set tiers = [
+     ('api_trusted', api_trusted, '{ 2379, 2380, 6443 }', 'tcp'),
+     ('kubelet', kubelet_trusted, '10250', 'tcp'),
+     ('node', node_trusted_cidrs, '8472', 'udp'),
+   ] %}
 destroy table inet k3s_bootstrap
 table inet k3s_bootstrap {
-{% if ipv4_cidrs %}
-  set api_trusted_ipv4 {
-    type ipv4_addr;
+{% for name, cidrs, ports, protocol in tiers %}
+{% for family, matcher, members in [
+     ('ipv4', 'ip', cidrs | reject('search', ':') | list),
+     ('ipv6', 'ip6', cidrs | select('search', ':') | list),
+   ] %}
+{% if members %}
+  set {{ name }}_{{ family }} {
+    type {{ family }}_addr;
     flags interval;
     auto-merge;
-    elements = { {{ ipv4_cidrs | join(', ') }} };
+    elements = { {{ members | join(', ') }} };
   }
 {% endif %}
-
-{% if ipv6_cidrs %}
-  set api_trusted_ipv6 {
-    type ipv6_addr;
-    flags interval;
-    auto-merge;
-    elements = { {{ ipv6_cidrs | join(', ') }} };
-  }
-{% endif %}
+{% endfor %}
+{% endfor %}
 
   chain input {
     type filter hook input priority filter; policy accept;
     iifname "lo" accept;
-{% if ipv4_cidrs %}
-    tcp dport { 2379, 2380, 6443 } ip saddr @api_trusted_ipv4 accept;
+{% for name, cidrs, ports, protocol in tiers %}
+{% for family, matcher, members in [
+     ('ipv4', 'ip', cidrs | reject('search', ':') | list),
+     ('ipv6', 'ip6', cidrs | select('search', ':') | list),
+   ] %}
+{% if members %}
+    {{ protocol }} dport {{ ports }} {{ matcher }} saddr @{{ name }}_{{ family }} accept;
 {% endif %}
-{% if ipv6_cidrs %}
-    tcp dport { 2379, 2380, 6443 } ip6 saddr @api_trusted_ipv6 accept;
-{% endif %}
-    tcp dport { 2379, 2380, 6443 } drop;
+{% endfor %}
+    {{ protocol }} dport {{ ports }} drop;
+{% endfor %}
   }
 }

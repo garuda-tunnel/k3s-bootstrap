@@ -21,6 +21,10 @@ gets `cluster-init`; `server` and `agent` join through the head.
 - Servers: `tls-san` always contains `127.0.0.1`; the kubeconfig is `0640`,
   group `ssh_user`'s primary group, in a `0710` directory (`config.yaml`
   stays `0600 root`). An agent's directory is `0700 root`.
+- Servers also render `flannel-backend: wireguard-native` unless the
+  caller's `k3s_config` sets `flannel-backend` (the caller always wins;
+  preflight refuses the silent switch on an installed server without the
+  key); flannel options are server-only and agents follow the servers.
 - `config.yaml` and the unit are module-owned and rendered on every
   converge, replacing manual edits; operator settings belong in
   `config.yaml.d/` and unit drop-ins, which the role never writes (README,

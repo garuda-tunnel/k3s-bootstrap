@@ -11,6 +11,9 @@ variables {
   authorized_keys      = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexamplekeymaterialnotarealkey admin@example"]
   k3s_version          = "v1.33.0+k3s1"
   cluster_cidrs        = ["10.42.0.0/16", "10.43.0.0/16"]
+  # Peers for the joining roles; the initial node is exempt until it has
+  # joiners, so it is also tested with an empty list below.
+  node_trusted_cidrs = ["192.0.2.0/24"]
 }
 
 # --- base --------------------------------------------------------------
@@ -401,7 +404,7 @@ run "accepts_empty_cluster_cidrs_when_firewall_off" {
   }
 }
 
-run "accepts_empty_cluster_cidrs_on_agent" {
+run "rejects_empty_cluster_cidrs_on_agent" {
   command = plan
 
   variables {
@@ -409,6 +412,8 @@ run "accepts_empty_cluster_cidrs_on_agent" {
     head          = { host = "192.0.2.1", user = "admin" }
     cluster_cidrs = []
   }
+
+  expect_failures = [var.cluster_cidrs]
 }
 
 run "accepts_mixed_ipv4_ipv6_cidr_lists" {
@@ -452,7 +457,7 @@ run "accepts_unlisted_custom_cidr_when_firewall_off" {
   }
 }
 
-run "accepts_unlisted_custom_cidr_on_agent" {
+run "rejects_unlisted_custom_cidr_on_agent" {
   command = plan
 
   variables {
@@ -460,6 +465,8 @@ run "accepts_unlisted_custom_cidr_on_agent" {
     head       = { host = "192.0.2.1", user = "admin" }
     k3s_config = { "cluster-cidr" = "10.44.0.0/16" }
   }
+
+  expect_failures = [var.cluster_cidrs]
 }
 
 run "rejects_cluster_cidr_missing_from_cluster_cidrs" {
@@ -702,4 +709,79 @@ run "agent_outputs_are_null" {
     condition     = output.api_forward_target == null
     error_message = "agents do not serve the API; api_forward_target must be null."
   }
+}
+
+run "node_trust_passes_both_families" {
+  command = plan
+  variables {
+    node_trusted_cidrs = ["192.0.2.0/24", "2001:db8::/32"]
+  }
+  assert {
+    condition     = local.run_vars.node_trusted_cidrs == tolist(var.node_trusted_cidrs)
+    error_message = "node_trusted_cidrs must reach Ansible unchanged."
+  }
+}
+
+run "rejects_invalid_node_trust" {
+  command = plan
+  variables {
+    node_trusted_cidrs = ["not-a-cidr"]
+  }
+  expect_failures = [var.node_trusted_cidrs]
+}
+
+run "rejects_null_node_trust_element" {
+  command = plan
+  variables {
+    node_trusted_cidrs = [null]
+  }
+  expect_failures = [var.node_trusted_cidrs]
+}
+
+run "accepts_initial_managed_without_node_trust" {
+  command = plan
+
+  variables {
+    node_trusted_cidrs = []
+  }
+
+  assert {
+    condition     = jsonencode(local.run_vars.node_trusted_cidrs) == "[]"
+    error_message = "a standalone initial node must keep the empty default node_trusted_cidrs."
+  }
+}
+
+run "accepts_server_without_node_trust_when_firewall_off" {
+  command = plan
+
+  variables {
+    node_type          = "server"
+    head               = { host = "192.0.2.1", user = "admin" }
+    firewall_mode      = "off"
+    node_trusted_cidrs = []
+  }
+}
+
+run "rejects_server_managed_without_node_trust" {
+  command = plan
+
+  variables {
+    node_type          = "server"
+    head               = { host = "192.0.2.1", user = "admin" }
+    node_trusted_cidrs = []
+  }
+
+  expect_failures = [var.node_trusted_cidrs]
+}
+
+run "rejects_agent_managed_without_node_trust" {
+  command = plan
+
+  variables {
+    node_type          = "agent"
+    head               = { host = "192.0.2.1", user = "admin" }
+    node_trusted_cidrs = []
+  }
+
+  expect_failures = [var.node_trusted_cidrs]
 }

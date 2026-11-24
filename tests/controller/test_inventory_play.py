@@ -40,6 +40,7 @@ NODE_VARS: dict[str, Any] = {
     "extra_packages": [],
     "k3s_version": "v1.33.0+k3s1",
     "api_trusted_cidrs": [],
+    "node_trusted_cidrs": [],
     "cluster_cidrs": [],
     "grow_root_filesystem": False,
     "apparmor_container_profile_fix": True,

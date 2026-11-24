@@ -3,8 +3,9 @@
 Installs the caller's extra packages (`extra_packages`, apt `state:
 present`; an empty list installs nothing; listing `qemu-guest-agent`
 also enables and starts its service), loads and persists the kernel
-modules (`br_netfilter`, `overlay` and `kernel_modules`), applies the
-k3s-owned and caller sysctls (`/etc/sysctl.d/90-k3s-bootstrap.conf`),
+modules (`br_netfilter`, `overlay`, `wireguard` and `kernel_modules`),
+applies the k3s-owned and caller sysctls
+(`/etc/sysctl.d/90-k3s-bootstrap.conf`),
 optionally grows the root partition and filesystem, and requests the
 first-install reboot.
 

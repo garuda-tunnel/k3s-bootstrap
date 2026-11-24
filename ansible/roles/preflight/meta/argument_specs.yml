@@ -28,10 +28,17 @@ argument_specs:
             type: str
             required: true
       firewall_mode:
-        description: managed installs the isolated nftables gate on servers; off touches nothing and refuses an existing module firewall.
+        description: managed installs the isolated nftables gate on every node type; off touches nothing and refuses an existing module firewall.
         type: str
         required: true
         choices: [managed, 'off']
+      node_trusted_cidrs:
+        description: Peer node source CIDRs. Read by the peer-coverage guard on installed
+          servers; every other node's InternalIP must be contained in it before the
+          managed firewall is applied.
+        type: list
+        elements: str
+        required: true
       sysctls:
         description: Caller sysctls (name to value); keys owned by k3s must keep the k3s value.
         type: dict
@@ -40,8 +47,12 @@ argument_specs:
         description: Exact k3s pin, for example v1.36.5+k3s1.
         type: str
         required: true
+      k3s_config:
+        description: Extra keys for /etc/rancher/k3s/config.yaml. Read by the flannel-backend guard on installed servers; module-owned keys win; never secrets.
+        type: dict
+        required: true
       kernel_modules:
-        description: Kernel modules to load and persist besides br_netfilter and overlay.
+        description: Kernel modules to load and persist besides br_netfilter, overlay and wireguard.
         type: list
         elements: str
         required: true

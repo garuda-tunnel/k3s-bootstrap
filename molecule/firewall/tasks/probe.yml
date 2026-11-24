@@ -2,7 +2,7 @@
 # Connect from the controller to each gated port of the instance and record
 # how each attempt ended, by exception type, never by message: 0 connected,
 # 3 timed out (dropped), 4 refused. Inputs: k3sb_instance; output: k3sb_probe
-# (list of exit codes for 6443, 2379, 2380).
+# (list of exit codes for k3sb_probe_ports, defaulting to 6443, 2379, 2380).
 - name: Probe the gated ports from the controller
   ansible.builtin.command:
     argv:
@@ -18,7 +18,7 @@
             sys.exit(4)
       - "{{ hostvars[k3sb_instance].ansible_host }}"
       - "{{ item }}"
-  loop: [6443, 2379, 2380]
+  loop: "{{ k3sb_probe_ports | default([6443, 2379, 2380]) }}"
   register: k3sb_probe_runs
   changed_when: false
   failed_when: k3sb_probe_runs.rc not in [0, 3, 4]

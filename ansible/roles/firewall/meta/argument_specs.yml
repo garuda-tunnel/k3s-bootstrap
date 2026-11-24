@@ -3,7 +3,7 @@
 # what the role does. Render: ansible-doc -t role -r ansible/roles firewall
 argument_specs:
   main:
-    short_description: Gate the k3s API and etcd ports with an isolated nftables table
+    short_description: Gate the k3s API, etcd, kubelet and VXLAN ports with an isolated nftables table
     description: See README.md in this role.
     options:
       node_type:
@@ -12,12 +12,17 @@ argument_specs:
         required: true
         choices: [initial, server, agent]
       firewall_mode:
-        description: managed installs the isolated nftables gate on servers; off touches nothing and refuses an existing module firewall.
+        description: managed installs the isolated nftables gate on every node type; off touches nothing and refuses an existing module firewall.
         type: str
         required: true
         choices: [managed, 'off']
       api_trusted_cidrs:
-        description: CIDRs allowed to reach the API and etcd ports besides loopback and cluster_cidrs.
+        description: CIDRs allowed to reach the API and etcd ports besides loopback, cluster_cidrs and node_trusted_cidrs.
+        type: list
+        elements: str
+        required: true
+      node_trusted_cidrs:
+        description: Peer node source CIDRs; they grant kubelet (10250), Flannel VXLAN (8472) and the API/etcd ports (2379-2380, 6443).
         type: list
         elements: str
         required: true

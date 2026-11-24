@@ -52,7 +52,7 @@ def tofu(module: Path, *args: str) -> str:
     return result.stdout
 
 
-def write_vars(module: Path, override: dict[str, str]) -> None:
+def write_vars(module: Path, override: dict[str, str | list[str]]) -> None:
     """Write ``terraform.tfvars.json`` with the base variables and ``override``."""
     (module / "terraform.tfvars.json").write_text(json.dumps(VARS | override))
 
@@ -115,10 +115,16 @@ def test_ansible_tree_change_alters_the_hash(module: Path, change: str) -> None:
 
 @pytest.mark.parametrize(
     "override",
-    [{"host_generation": "instance-2"}, {"k3s_version": "v1.33.1+k3s1"}],
-    ids=["generation", "input"],
+    [
+        {"host_generation": "instance-2"},
+        {"k3s_version": "v1.33.1+k3s1"},
+        {"node_trusted_cidrs": ["192.0.2.0/24"]},
+    ],
+    ids=["generation", "input", "node-trust"],
 )
-def test_generation_and_input_change_alter_the_hash(module: Path, override: dict[str, str]) -> None:
+def test_generation_and_input_change_alter_the_hash(
+    module: Path, override: dict[str, str | list[str]]
+) -> None:
     """Verify a new ``host_generation`` or a changed input changes ``run_hash``.
 
     Validates: FR-017 (a recreated VM or new settings are applied).

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -124,3 +125,86 @@ def test_agents_join_the_hub_in_parallel(cluster: Cluster) -> None:
         "node-role.kubernetes.io/control-plane" in node["metadata"]["labels"] for node in nodes
     ].count(True) == 1
     assert not tokens
+
+
+def test_cross_node_traffic_through_managed_firewalls(cluster: Cluster) -> None:
+    """Verify pod-to-pod and kubelet-metrics traffic across firewalled nodes.
+
+    Validates: the managed firewall on every node and the wireguard-native flannel
+    default keep cross-node traffic working: a pod reaches a pod on another node
+    through the WireGuard overlay (UDP 51820, deliberately not gated), and
+    metrics-server scrapes kubelet 10250 across nodes, which flannel's ip-masq
+    rules make arrive with the source node IP (node_trusted_cidrs).
+    Code: ansible/roles/firewall/templates/firewall.nft.j2; ansible/roles/k3s/tasks/main.yml
+
+    Assertion: a ping between pods on two different nodes succeeds, the Metrics
+    API returns usage for all three nodes, and the overlay interface is
+    ``flannel-wg`` (never ``flannel.1``).
+
+    Method:
+    1. Arrange: the applied composition, all nodes Ready; one busybox pod pinned
+    to each of two distinct nodes.
+    2. Act: ping the second pod's IP from the first; poll the Metrics API
+    (``/apis/metrics.k8s.io/v1beta1/nodes``) and read the overlay links on the hub.
+    3. Assert: the statements above.
+
+    Status: UNVERIFIED. Written against the fixture and the k3s/flannel
+    behaviour documented in the root README; this tier needs Vagrant/libvirt,
+    which is not available where this test was authored. Run it with the
+    command in tests/vm/README.md before trusting it.
+    """
+    hub = cluster.hub
+    kubectl = "sudo -n k3s kubectl"
+    nodes = json.loads(probe(hub, f"{kubectl} get nodes -o json"))["items"]
+    names = sorted(node["metadata"]["name"] for node in nodes)
+    assert len(names) == 3
+    image = "docker.io/library/busybox:1.37.0"
+
+    for pod, node in zip(("k3sb-cross-a", "k3sb-cross-b"), (names[0], names[1]), strict=True):
+        probe(
+            hub,
+            f"sudo -n k3s kubectl run {pod} --image={image} --restart=Never"
+            f' --overrides \'{{"spec":{{"nodeName":"{node}"}}}}\''
+            " --command -- sleep 600",
+        )
+        probe(hub, f"{kubectl} wait --for=condition=Ready pod/{pod} --timeout=180s")
+
+    # The overrides pin the pods; prove they really landed on distinct nodes.
+    pod_nodes = [
+        probe(hub, f"{kubectl} get pod {pod} -o jsonpath='{{.spec.nodeName}}'")
+        for pod in ("k3sb-cross-a", "k3sb-cross-b")
+    ]
+    assert pod_nodes[0] and pod_nodes[1] and pod_nodes[0] != pod_nodes[1]
+
+    ips = [
+        probe(hub, f"{kubectl} get pod {pod} -o jsonpath='{{.status.podIP}}'")
+        for pod in ("k3sb-cross-a", "k3sb-cross-b")
+    ]
+    assert ips[0] and ips[1] and ips[0] != ips[1]
+
+    # The overlay carries the ping between the two nodes.
+    probe(hub, f"{kubectl} exec k3sb-cross-a -- ping -c 1 -W 2 {ips[1]}")
+
+    # kubelet 10250 across nodes: metrics-server scrapes each kubelet, and
+    # flannel masquerades pod traffic to node IPs, so the source is a peer
+    # node IP that node_trusted_cidrs must allow. `kubectl top nodes`
+    # prints <unknown> for nodes it cannot scrape, so poll the Metrics API
+    # instead: it only lists nodes that were actually scraped.
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        raw = hub.ssh(f"{kubectl} get --raw /apis/metrics.k8s.io/v1beta1/nodes")
+        if raw.returncode == 0:
+            items = json.loads(raw.stdout).get("items", [])
+            scraped = {item["metadata"]["name"] for item in items}
+            if scraped >= set(names) and all(item.get("usage") for item in items):
+                break
+        time.sleep(15)
+    else:
+        pytest.fail(f"kubelet metrics never covered every node:\n{raw.stderr}")
+
+    # The wireguard-native default built the overlay; VXLAN would have left flannel.1.
+    probe(hub, "sudo -n ip link show flannel-wg")
+    assert hub.ssh("sudo -n ip link show flannel.1").returncode != 0
+
+    for pod in ("k3sb-cross-a", "k3sb-cross-b"):
+        hub.ssh(f"{kubectl} delete pod {pod} --wait=false --ignore-not-found")

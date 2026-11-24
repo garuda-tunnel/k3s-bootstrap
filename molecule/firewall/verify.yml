@@ -4,12 +4,12 @@
   gather_facts: false
   become: true
   tasks:
-    - name: Prove the API and etcd ports answer on loopback
+    - name: Prove the API, etcd and kubelet ports answer on loopback
       ansible.builtin.wait_for:
         host: 127.0.0.1
         port: "{{ item }}"
         timeout: 5
-      loop: [6443, 2379, 2380]
+      loop: [6443, 2379, 2380, 10250]
 
 - name: Verify trust, refusals and foreign-table safety from the controller
   hosts: localhost
@@ -30,10 +30,39 @@
       ansible.builtin.assert:
         that: k3sb_probe == [0, 0, 0]
 
-    - name: Distrust the controller
+    - name: Probe kubelet without peer trust
+      ansible.builtin.include_tasks: tasks/probe.yml
+      vars:
+        k3sb_probe_ports: [10250]
+
+    - name: Assert API trust does not grant kubelet access
+      ansible.builtin.assert:
+        that: k3sb_probe == [3]
+
+    - name: Trust the controller as a peer and drop its API trust
       ansible.builtin.include_tasks: ../shared/tasks/apply.yml
       vars:
-        k3sb_apply_vars: {api_trusted_cidrs: [192.0.2.0/24]}
+        k3sb_apply_vars:
+          api_trusted_cidrs: [192.0.2.0/24]
+          node_trusted_cidrs: [192.168.122.1/32]
+
+    - name: Probe the gated ports with peer trust only
+      ansible.builtin.include_tasks: tasks/probe.yml
+      vars:
+        k3sb_probe_ports: [6443, 2379, 2380, 10250]
+
+    - name: Assert node trust alone grants the API, etcd and kubelet ports
+      ansible.builtin.assert:
+        that: k3sb_probe == [0, 0, 0, 0]
+
+    - name: Distrust the controller as a peer too
+      # Distrust must cover both lists: the instance's base vars still
+      # API-trust the controller, and apply.yml merges over them.
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+      vars:
+        k3sb_apply_vars:
+          api_trusted_cidrs: [192.0.2.0/24]
+          node_trusted_cidrs: []
 
     - name: Probe the gated ports from the now untrusted controller
       ansible.builtin.include_tasks: tasks/probe.yml
@@ -161,6 +190,12 @@
       ansible.builtin.include_tasks: ../shared/tasks/reject.yml
       vars:
         k3sb_variant_vars: {api_trusted_cidrs: [192.0.2.0/33]}
+        k3sb_reject_task: 'firewall : Install the isolated nftables ruleset'
+
+    - name: Refuse an invalid peer ruleset before it replaces the live table
+      ansible.builtin.include_tasks: ../shared/tasks/reject.yml
+      vars:
+        k3sb_variant_vars: {node_trusted_cidrs: [192.0.2.0/33]}
         k3sb_reject_task: 'firewall : Install the isolated nftables ruleset'
 
     - name: Refuse the managed firewall while ufw is enabled

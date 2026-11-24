@@ -33,8 +33,10 @@ provisioner:
         k3s_head: k3sb-molecule-recovery-init
       k3sb-molecule-recovery-adopt:
         # The kubeconfig group must be the login user's real primary group,
-        # which is only meaningful when it differs from the user name.
-        k3s_node: {node_type: initial, ssh_user: ops}
+        # which is only meaningful when it differs from the user name. The
+        # legacy install runs flannel's vxlan, so the caller pins it: without
+        # the key preflight refuses to switch the adopted backend silently.
+        k3s_node: {node_type: initial, ssh_user: ops, k3s_config: {flannel-backend: vxlan}}
   playbooks:
     prepare: prepare.yml
     converge: converge.yml

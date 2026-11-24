@@ -38,6 +38,12 @@ locals {
     authorized_keys      = var.authorized_keys
     k3s_version          = var.k3s_version
   }
+
+  # Every node host of the composition, hub and agents alike; a /128 for
+  # IPv6 addresses, a /32 for IPv4. Listing a node's own address is
+  # harmless and keeps the derivation one expression.
+  node_hosts         = concat([var.hub.host], [for agent in values(var.agents) : agent.host])
+  node_trusted_cidrs = [for host in local.node_hosts : "${host}/${strcontains(host, ":") ? 128 : 32}"]
 }
 
 module "hub" {
@@ -54,6 +60,7 @@ module "hub" {
   k3s_version          = local.common.k3s_version
   api_trusted_cidrs    = var.api_trusted_cidrs
   cluster_cidrs        = ["10.42.0.0/16", "10.43.0.0/16"]
+  node_trusted_cidrs   = local.node_trusted_cidrs
 }
 
 module "agent" {
@@ -70,5 +77,6 @@ module "agent" {
   ssh_private_key_file = local.common.ssh_private_key_file
   authorized_keys      = local.common.authorized_keys
   k3s_version          = local.common.k3s_version
-  firewall_mode        = "off"
+  cluster_cidrs        = ["10.42.0.0/16", "10.43.0.0/16"]
+  node_trusted_cidrs   = local.node_trusted_cidrs
 }

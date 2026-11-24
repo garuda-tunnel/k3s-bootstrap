@@ -130,7 +130,7 @@ variable "sysctls" {
 }
 
 variable "kernel_modules" {
-  description = "Kernel modules to load on boot."
+  description = "Kernel modules to load and persist on boot, besides the module's own (br_netfilter, overlay and wireguard)."
   type        = list(string)
   default     = []
 }
@@ -175,7 +175,7 @@ variable "k3s_config" {
 }
 
 variable "firewall_mode" {
-  description = "Firewall management: managed provisions rules for SSH and the k3s API, off leaves the host firewall untouched."
+  description = "Firewall management: managed provisions the isolated nftables table that gates the k3s ports (see api_trusted_cidrs, node_trusted_cidrs and cluster_cidrs), off leaves the host firewall untouched."
   type        = string
   default     = "managed"
 
@@ -186,7 +186,7 @@ variable "firewall_mode" {
 }
 
 variable "api_trusted_cidrs" {
-  description = "CIDRs allowed to reach the k3s API when firewall_mode is managed. The trusted set also always includes cluster_cidrs, and loopback is always allowed (the api_forward_target path). With an empty list the API is reachable only from those."
+  description = "CIDRs allowed to reach the k3s API (TCP 6443) and embedded etcd (TCP 2379-2380) when firewall_mode is managed, for sources that are not cluster nodes (controller, operators). The trusted set also always includes cluster_cidrs and node_trusted_cidrs, and loopback is always allowed (the api_forward_target path). With an empty list the API is reachable only from those."
   type        = list(string)
   default     = []
   nullable    = false
@@ -197,8 +197,25 @@ variable "api_trusted_cidrs" {
   }
 }
 
+variable "node_trusted_cidrs" {
+  description = "Peer node source CIDRs. On a managed node they grant kubelet (TCP 10250), Flannel VXLAN (UDP 8472) and API/etcd (TCP 6443, 2379-2380) access, so every peer node is listed exactly once, here. The flannel wireguard-native ports (UDP 51820/51821) carry no rule: WireGuard authenticates peers by key."
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition     = alltrue([for cidr in var.node_trusted_cidrs : can(cidrhost(cidr, 0))])
+    error_message = "Every node_trusted_cidrs entry must be a valid CIDR, for example 192.0.2.0/24."
+  }
+
+  validation {
+    condition     = var.firewall_mode != "managed" || var.node_type == "initial" || length(var.node_trusted_cidrs) > 0
+    error_message = "server and agent nodes always have peer nodes: set node_trusted_cidrs to the peer source CIDRs. The initial server needs them too once other nodes join, so set them on every node of the cluster when adding joiners."
+  }
+}
+
 variable "cluster_cidrs" {
-  description = "Pod and service network CIDRs the cluster uses (k3s defaults 10.42.0.0/16 and 10.43.0.0/16, or your cluster-cidr and service-cidr), the only cluster networks the managed firewall trusts. Required on initial and server nodes when firewall_mode is managed."
+  description = "Pod and service network CIDRs the cluster uses (k3s defaults 10.42.0.0/16 and 10.43.0.0/16, or your cluster-cidr and service-cidr), the only cluster networks the managed firewall trusts. Required on every node type when firewall_mode is managed."
   type        = list(string)
   default     = []
   nullable    = false
@@ -209,20 +226,20 @@ variable "cluster_cidrs" {
   }
 
   validation {
-    condition     = var.node_type == "agent" || var.firewall_mode != "managed" || length(var.cluster_cidrs) > 0
-    error_message = "set the cluster's pod and service CIDRs in cluster_cidrs: the managed firewall on a server role trusts only those cluster networks."
+    condition     = var.firewall_mode != "managed" || length(var.cluster_cidrs) > 0
+    error_message = "set the cluster's pod and service CIDRs in cluster_cidrs: the managed firewall on every node trusts only those cluster networks."
   }
 
   validation {
     # k3s accepts a comma-separated string or a list; every CIDR must be
     # listed verbatim, or the managed firewall would drop cluster traffic.
-    condition = var.node_type == "agent" || var.firewall_mode != "managed" || try(alltrue([
+    condition = var.firewall_mode != "managed" || try(alltrue([
       for key in ["cluster-cidr", "service-cidr"] : try(var.k3s_config[key], null) == null ? true : alltrue([
         for cidr in(can(tolist(var.k3s_config[key])) ? tolist(var.k3s_config[key]) : split(",", var.k3s_config[key])) :
         contains(var.cluster_cidrs, trimspace(cidr))
       ])
     ]), false)
-    error_message = "every CIDR in k3s_config cluster-cidr and service-cidr must also appear in cluster_cidrs (verbatim) when the managed firewall runs on a server role."
+    error_message = "every CIDR in k3s_config cluster-cidr and service-cidr must also appear in cluster_cidrs (verbatim) when the managed firewall runs."
   }
 }
 

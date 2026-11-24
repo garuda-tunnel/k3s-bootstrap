@@ -1,0 +1,11 @@
+---
+- name: Render the production firewall template on the controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Render ruleset
+      ansible.builtin.template:
+        src: "{{ template_path }}"
+        dest: "{{ rules_path }}"
+        mode: '0600'

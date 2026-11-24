@@ -437,6 +437,65 @@
       installation; node_type={{ node_type }} would change its role or
       datastore, which this module refuses to do automatically.
 
+- name: Check the flannel backend before an installed server converges
+  when:
+    - node_type != 'agent'
+    - preflight_k3s_installed_class == 'etcd'
+  block:
+    - name: Find the k3s config files that set flannel-backend
+      # The same files and key forms as the data-layout search. `contains`
+      # selects only files carrying the key, so k3s.yaml, registries.yaml and
+      # any file without it are never read into the run.
+      ansible.builtin.find:
+        paths: /etc/rancher/k3s
+        recurse: true
+        file_type: file
+        follow: true
+        patterns: ['*.yaml', '*.yml']
+        contains: '^["'']?flannel-backend\+?["'']?\s*:'
+      register: preflight_k3s_flannel_files
+
+    - name: Read the config files that set flannel-backend
+      # Operator config may also hold secrets: the reads never reach a log;
+      # only the extracted backend becomes a fact.
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop: "{{ preflight_k3s_flannel_files.files | map(attribute='path') | list | sort }}"
+      register: preflight_k3s_flannel_bodies
+      no_log: true
+
+    - name: Record the flannel backend in force on the node
+      # k3s applies config.yaml first and config.yaml.d/* after it, the last
+      # value winning, so the last key match of the last file that sets it is
+      # the backend in force; no key anywhere is flannel's own default, vxlan.
+      # Matched per file: a join('\n') in this folded scalar is no newline.
+      ansible.builtin.set_fact:
+        preflight_flannel_backend: >-
+          {{ preflight_k3s_flannel_bodies.results | map(attribute='content') | map('b64decode')
+             | map('regex_findall', preflight_flannel_key_regex) | flatten | last
+             | default('vxlan', true) }}
+      vars:
+        # Plain, quoted and append key forms, a top-level key at column 0 only.
+        preflight_flannel_key_regex: '(?m)^["'']?flannel-backend\+?["'']?\s*:\s*["'']?([a-z0-9-]+)'
+
+    - name: Refuse a silent flannel backend switch on an installed server
+      # The module default for servers is wireguard-native. Converging an
+      # installed server whose k3s_config does not set flannel-backend would
+      # switch the backend in place and partition a multi-node cluster (nodes
+      # on different backends cannot talk; the old flannel.1 routes persist
+      # until a reboot), so the switch must stay an explicit caller decision.
+      ansible.builtin.assert:
+        that: >-
+          'flannel-backend' in k3s_config
+          or preflight_flannel_backend == 'wireguard-native'
+        fail_msg: >-
+          The installed server runs flannel backend '{{ preflight_flannel_backend }}' but
+          k3s_config sets no flannel-backend, so the module default wireguard-native would
+          switch it silently and can partition a multi-node cluster; to keep the current
+          backend set k3s_config = {flannel-backend = "{{ preflight_flannel_backend }}"}, or to
+          switch deliberately set k3s_config = {flannel-backend = "wireguard-native"} and
+          follow the README migration (all servers, then reboot every node, servers first).
+
 - name: Read the module state marker
   ansible.builtin.slurp:
     src: "{{ k3s_marker_path }}"
@@ -487,9 +546,122 @@
       {{ preflight_k3s_installed_version }}.
   when: preflight_k3s.binary
 
+- name: Check the cluster peers of an installed server against node_trusted_cidrs
+  # The managed table gates kubelet 10250 (cluster_cidrs + node_trusted_cidrs)
+  # and VXLAN 8472 (node_trusted_cidrs only). Plan-time validation cannot
+  # catch a list that misses the peers of an `initial` node (it is exempt
+  # because a standalone node has no peers), and a list derived from the SSH
+  # host instead of the address peers send from (their node-ip) breaks the
+  # same way on any server: converging would silently drop those peers and,
+  # with CoreDNS on this node, break DNS cluster-wide. So an installed server
+  # is checked at converge time, against the peers its own API reports. Not
+  # agents (no admin kubeconfig), not a fresh install (class `none`, no
+  # peers yet) and not off mode (no table).
+  when:
+    - firewall_mode == 'managed'
+    - node_type != 'agent'
+    - preflight_k3s_installed_class == 'etcd'
+  block:
+    - name: Read the peer node addresses from the node's own API
+      # jsonpath keeps the answer to node names and InternalIPs (v4 and v6,
+      # the addresses peers send from): the least this guard needs in the
+      # run. The kubeconfig is only read by k3s itself, as root, in-process;
+      # its contents never enter the run.
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - --kubeconfig
+          - /etc/rancher/k3s/k3s.yaml
+          - --request-timeout=10s
+          - get
+          - nodes
+          - -o
+          - 'jsonpath={range .items[*]}{.metadata.name}{" "}{range .status.addresses[?(@.type=="InternalIP")]}{.address}{" "}{end}{"\n"}{end}'
+      changed_when: false
+      timeout: 30
+      register: preflight_peer_nodes
+      failed_when: false
+
+    - name: Note when the node API did not answer
+      # A warning, not a refusal: converge is the way a stopped k3s is
+      # brought back (the k3s role starts the unit; preflight itself passes
+      # a stopped installation with its data intact), so failing here would
+      # brick that recovery path. The operator is told to verify the peer
+      # coverage by hand, and the guard runs on the next converge whose
+      # API answers.
+      ansible.builtin.debug:
+        msg: >-
+          The k3s API on this installed server did not answer, so this run
+          cannot verify that node_trusted_cidrs covers the cluster peers
+          before the firewall is applied; check by hand that every peer's
+          node-ip is in node_trusted_cidrs. kubectl exited
+          {{ preflight_peer_nodes.rc }}: {{ preflight_peer_nodes.stderr | default('') | trim }}
+      when: preflight_peer_nodes.rc != 0
+
+    - name: Find the cluster peers node_trusted_cidrs does not cover
+      # CIDR containment needs ipaddress math: no filter of the pinned
+      # controller toolchain offers it (ansible.utils.ipaddr would add the
+      # unpinned netaddr dependency), and string prefix matching is wrong
+      # across prefix lengths and families. python3 runs on the node with
+      # Ansible's own interpreter; peer data reaches it as arguments, never
+      # as code.
+      vars:
+        # The same self-name resolution as the readiness role.
+        preflight_self_node_name: "{{ k3s_config['node-name'] | default(ansible_facts.nodename | lower) }}"
+        preflight_coverage_check: |
+          import ipaddress
+          import sys
+
+          networks = []
+          for cidr in sys.argv[1].split(','):
+              try:
+                  networks.append(ipaddress.ip_network(cidr, strict=False))
+              except ValueError:
+                  # A malformed entry covers nothing; the firewall role's
+                  # ruleset validation refuses it with its own message.
+                  continue
+          uncovered = []
+          for line in sys.argv[3].splitlines():
+              fields = line.split()
+              if not fields or fields[0] == sys.argv[2]:
+                  continue
+              for address in fields[1:]:
+                  parsed = ipaddress.ip_address(address)
+                  # ip_network membership refuses the other family outright.
+                  if not any(parsed.version == net.version and parsed in net
+                             for net in networks):
+                      uncovered.append(fields[0] + ' ' + address)
+          print('\n'.join(uncovered))
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_python.executable }}"
+          - -c
+          - "{{ preflight_coverage_check }}"
+          - "{{ node_trusted_cidrs | join(',') }}"
+          - "{{ preflight_self_node_name }}"
+          - "{{ preflight_peer_nodes.stdout }}"
+      changed_when: false
+      register: preflight_uncovered_peers
+      when: preflight_peer_nodes.rc == 0
+
+    - name: Refuse a managed firewall that would drop cluster peers
+      ansible.builtin.assert:
+        that: preflight_uncovered_peers.stdout | trim | length == 0
+        fail_msg: >-
+          node_trusted_cidrs {{ node_trusted_cidrs | to_json }} does not cover
+          the cluster peers {{ preflight_uncovered_peers.stdout_lines | default([]) | join(', ') }};
+          the managed firewall would drop their kubelet and VXLAN traffic. Add
+          the addresses the peers send from (their node-ip InternalIP, as
+          reported by the node API) to node_trusted_cidrs and apply again.
+      when: preflight_peer_nodes.rc == 0
+
 - name: Build the required kernel module list
+  # wireguard: the module's default flannel backend (wireguard-native) needs
+  # the kernel module on every node, servers and agents; flannel only creates
+  # the link via netlink and never loads the module itself.
   ansible.builtin.set_fact:
-    preflight_kernel_modules: "{{ (['br_netfilter', 'overlay'] + kernel_modules) | unique | list }}"
+    preflight_kernel_modules: "{{ (['br_netfilter', 'overlay', 'wireguard'] + kernel_modules) | unique | list }}"
 
 - name: Check that every required kernel module can be loaded
   # modinfo resolves modules.dep, modules.builtin and aliases without loading

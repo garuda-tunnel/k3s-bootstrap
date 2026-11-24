@@ -26,7 +26,7 @@ run "no_sensitive_variable" {
       var.node_type, var.host, var.port, var.head, var.host_key_check, var.host_generation,
       var.bootstrap_user, var.ssh_user, var.ssh_private_key_file, var.authorized_keys,
       var.sysctls, var.kernel_modules, var.extra_packages, var.k3s_version, var.k3s_config, var.firewall_mode,
-      var.api_trusted_cidrs, var.cluster_cidrs, var.grow_root_filesystem, var.apparmor_container_profile_fix,
+      var.api_trusted_cidrs, var.node_trusted_cidrs, var.cluster_cidrs, var.grow_root_filesystem, var.apparmor_container_profile_fix,
       var.connection_timeout, var.readiness_timeout,
     ] : issensitive(value)])
     error_message = "no module input may be sensitive: join tokens are never caller input."
@@ -40,7 +40,7 @@ run "run_vars_are_node_settings_only" {
     condition = sort(keys(local.run_vars)) == sort([
       "node_type", "host", "port", "head", "host_key_check", "bootstrap_user", "ssh_user",
       "ssh_private_key_file", "authorized_keys", "sysctls", "kernel_modules", "extra_packages", "k3s_version",
-      "k3s_config", "firewall_mode", "api_trusted_cidrs", "cluster_cidrs",
+      "k3s_config", "firewall_mode", "api_trusted_cidrs", "node_trusted_cidrs", "cluster_cidrs",
       "grow_root_filesystem", "apparmor_container_profile_fix",
       "connection_timeout", "readiness_timeout",
     ])

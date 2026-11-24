@@ -76,6 +76,31 @@
           - k3sb_dir.mode == ('0700' if k3sb_agent else '0710')
           - k3sb_paths.results[2].stat.exists != k3sb_agent
 
+- name: Verify the managed firewall on the agent
+  # Restoring the agent exclusion must fail here: the table and unit are
+  # the agent's proof that managed mode reached it. No untrusted-source
+  # drop probe exists in this scenario: every reachable source (the
+  # controller, 192.168.122.1) is inside the node_trusted_cidrs the
+  # scenario grants, and untrusted-drop behaviour is proven per-source in
+  # the firewall scenario.
+  hosts: k3sb-molecule-agent
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Require the module firewall table on the agent
+      ansible.builtin.command: nft list table inet k3s_bootstrap
+      changed_when: false
+
+    - name: Read the agent's firewall unit state
+      ansible.builtin.command:
+        argv: [systemctl, is-enabled, k3s-bootstrap-firewall]
+      changed_when: false
+      register: k3sb_agent_firewall_unit
+
+    - name: Assert the agent's firewall unit is enabled
+      ansible.builtin.assert:
+        that: k3sb_agent_firewall_unit.stdout == 'enabled'
+
 - name: Verify the agent stays Ready across a restart with its token deleted
   hosts: k3sb-molecule-agent
   gather_facts: false
@@ -136,3 +161,38 @@
     - name: Assert no output carried a token
       ansible.builtin.assert:
         that: k3sb_token_leaks | int == 0
+
+- name: Verify the head refuses a firewall that would drop its peers
+  # The plan exempts `initial` from a non-empty node_trusted_cidrs (a
+  # standalone node has no peers), so only converge time can check the head:
+  # re-applying it with a list that covers no peer must be refused by the
+  # peer-coverage guard, and the cluster must still converge afterwards.
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../shared/vars/module_vars.yml]
+  tasks:
+    - name: Re-apply the head without peer coverage
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+      vars:
+        k3sb_instance: k3sb-molecule-cluster-init
+        k3sb_apply_vars: {node_trusted_cidrs: [198.51.100.0/24]}
+        k3sb_apply_may_fail: true
+
+    - name: Assert the head was refused while a peer address is uncovered
+      vars:
+        k3sb_refusal: >-
+          {{ k3sb_run.stdout | regex_findall('[^\n]*does not cover the cluster peers[^\n]*') }}
+      ansible.builtin.assert:
+        that:
+          - k3sb_run.rc != 0
+          - >-
+            k3sb_run.stdout is regex(
+              'TASK \[preflight : Refuse a managed firewall that would drop cluster peers\]')
+          - k3sb_refusal | join('') is search('192\.168\.122\.')
+          - k3sb_refusal | join('') is search('k3sb-molecule-(server|agent)')
+
+    - name: Restore the head's peer coverage
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+      vars:
+        k3sb_instance: k3sb-molecule-cluster-init

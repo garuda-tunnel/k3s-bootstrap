@@ -17,6 +17,13 @@ opt-in, serial, and never runs in CI.
   composition in `fixture/cluster/`: an `initial` hub and two agents with
   `head = module.hub.head`, applied in parallel. Three Ready nodes and no
   bootstrap token left on the hub.
+- `test_cluster.py::test_cross_node_traffic_through_managed_firewalls`
+  — the same composition with every node in `managed` mode and the default
+  `wireguard-native` backend: a pod on one node reaches a pod on another
+  node, and the Metrics API returns usage for all three nodes (kubelet 10250
+  across nodes, which flannel masquerade makes arrive with the source
+  node IP). Written but not yet executed on a stand: run it before
+  trusting it (UNVERIFIED).
 - `test_k3s_recovery.py::test_rerun_after_agent_join_killed_once_its_token_was_minted`
   — the agent apply is killed on the task that writes the minted token
   (the controller-death case); an unchanged retry joins, and every token

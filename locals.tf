@@ -19,6 +19,7 @@ locals {
     k3s_config                     = var.k3s_config
     firewall_mode                  = var.firewall_mode
     api_trusted_cidrs              = var.api_trusted_cidrs
+    node_trusted_cidrs             = var.node_trusted_cidrs
     cluster_cidrs                  = var.cluster_cidrs
     grow_root_filesystem           = var.grow_root_filesystem
     apparmor_container_profile_fix = var.apparmor_container_profile_fix

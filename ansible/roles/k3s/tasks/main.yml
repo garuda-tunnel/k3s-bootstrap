@@ -57,6 +57,10 @@
           tls-san: "{{ (k3s_config.get('tls-san', []) + ['127.0.0.1']) | unique }}"
           write-kubeconfig-mode: '0640'
           write-kubeconfig-group: "{{ k3s_kubeconfig_group | default(none) }}"
+          # Flannel backend options are server-only (agents follow the
+          # servers); the caller's k3s_config value always wins, and the
+          # module default encrypts the pod overlay.
+          flannel-backend: "{{ k3s_config.get('flannel-backend', 'wireguard-native') }}"
       ansible.builtin.set_fact:
         k3s_rendered_config: >-
           {{ k3s_config
@@ -84,7 +88,7 @@
         msg: >-
           The node cannot reach the head's k3s API at {{ head.host }}:6443; when
           the head runs the managed firewall, add this node's address to the
-          head's api_trusted_cidrs.
+          head's node_trusted_cidrs (peer nodes reach the API through it).
       when:
         - node_type != 'initial'
         - not preflight_installed_marker.stat.exists or preflight_k3s_installed_class == 'none'

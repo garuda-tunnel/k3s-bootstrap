@@ -19,7 +19,25 @@ itself changes nothing.
   are refused. The class of the existing install (`none`, `etcd`, `agent`,
   `sqlite`, `unknown`) must match `node_type`; the marker
   `/var/lib/k3s-bootstrap/installed` records the node type and refuses a
-  change; a downgrade is refused.
+  change; a downgrade is refused. An installed server (`initial` or
+  `server`) whose `k3s_config` sets no `flannel-backend` and that does not
+  already run `wireguard-native` is refused instead of being switched
+  silently to the module default; the backend in force is the last
+  `flannel-backend` of `config.yaml` and `config.yaml.d/*` (absent means
+  vxlan), and a caller that sets the key always wins, agents are exempt.
+- Peer coverage (`firewall_mode: managed`, `node_type: initial` or
+  `server`, install class `etcd`): before the firewall role changes the
+  table, every OTHER node's InternalIP addresses (v4 and v6) are read from
+  the node's own API (`k3s kubectl get nodes`, as root, through the local
+  kubeconfig) and must be contained in `node_trusted_cidrs`; an uncovered
+  peer is refused by name and address, with the instruction to add the
+  addresses peers send from (their node-ip). The kubeconfig itself is only
+  read by k3s in-process, never into the run. A fresh install (class
+  `none`), agents (no admin kubeconfig) and `off` mode never run the
+  check. When the API does not answer, the run continues with a warning
+  instead of failing: converge is the way a stopped k3s is restarted, so a
+  refusal here would brick that recovery path; the check runs on the next
+  converge.
 - The module's own unfinished first install (only module-managed units, no
   marker, no datastore) is `none`, so a failed run can be retried. For
   `initial` a server CA keeps it out of that class: `cluster-init` over
@@ -28,8 +46,9 @@ itself changes nothing.
   reachable and an initialised server (its token file is only `stat`ed);
   any local cluster CA must equal the head's.
 - Host capability: every kernel module (`br_netfilter`, `overlay`,
-  `kernel_modules`) is loadable (`modinfo`, nothing loaded); with
-  `grow_root_filesystem` (the default) the root is ext4 or xfs on a direct
+  `wireguard`, `kernel_modules`) is loadable (`modinfo`, nothing
+  loaded); with `grow_root_filesystem` (the default) the root is ext4 or
+  xfs on a direct
   disk partition, otherwise the node is refused.
 - Unit and environment files may hold credentials: they are read with
   `no_log`.

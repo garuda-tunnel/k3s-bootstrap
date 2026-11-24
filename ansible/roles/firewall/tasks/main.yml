@@ -1,16 +1,17 @@
 ---
-# Managed mode on a server (initial or server): one isolated nftables table
-# gates the k3s API (6443) and the embedded etcd client and peer ports
-# (2379-2380, which etcd binds on the node address too) to loopback,
-# api_trusted_cidrs and cluster_cidrs. Agents serve neither, and off mode
-# touches nothing (preflight refuses off mode over an existing module
-# firewall).
+# Managed mode gates, on every node type, the ports a k3s node serves:
+# the API and embedded etcd (TCP 6443, 2379-2380; etcd binds the node
+# address as well as loopback, and it is the node-address bind that puts
+# those ports in reach of peers), kubelet (TCP 10250) and the Flannel
+# VXLAN underlay (UDP 8472). Agents are included: they serve kubelet and
+# flannel, and with the embedded registry mirror also TCP 6443 and 5001.
+# Off mode touches nothing, and preflight refuses off mode over an
+# existing module firewall (see README.md).
 - name: Manage the isolated firewall
   when:
     - firewall_mode == 'managed'
-    - node_type != 'agent'
   block:
-    - name: Install nftables for managed server firewalls
+    - name: Install nftables for the managed node firewall
       ansible.builtin.apt:
         name: nftables
         state: present

@@ -6,7 +6,7 @@
   ansible.builtin.stat:
     path: "/sys/module/{{ item }}"
     get_checksum: false
-  loop: [br_netfilter, overlay, tcp_bbr]
+  loop: [br_netfilter, overlay, wireguard, tcp_bbr]
   register: k3sb_module_dirs
 
 - name: Read the running kernel release
@@ -38,11 +38,11 @@
 - name: Assert modules and sysctls
   ansible.builtin.assert:
     that:
-      - k3sb_module_dirs.results | map(attribute='stat.isdir', default=false) | list == [true, true, true]
+      - k3sb_module_dirs.results | map(attribute='stat.isdir', default=false) | list == [true, true, true, true]
       - >-
         (k3sb_builtin_module ~ '.ko')
         in ((k3sb_modules_builtin.content | b64decode).splitlines() | map('basename') | list)
-      - (k3sb_modules_content.content | b64decode) == "br_netfilter\noverlay\ntcp_bbr\naf_packet\n"
+      - (k3sb_modules_content.content | b64decode) == "br_netfilter\noverlay\nwireguard\ntcp_bbr\naf_packet\n"
       - >-
         k3sb_sysctl_live.results | map(attribute='content') | map('b64decode') | map('trim') | list
         == ['262144', '1', '1']

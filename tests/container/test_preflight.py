@@ -87,6 +87,38 @@ def head_state(head: SystemdHost, ca: str | None, token: bool) -> AbstractContex
     return arranged(head.host, setup, "rm -rf /var/lib/rancher")
 
 
+def k3s_api_stub(nodes: str) -> str:
+    """Return a stand-in k3s answering the two calls preflight makes to it.
+
+    ``--version`` reports the requested pin (no downgrade refusal); ``kubectl``
+    prints ``nodes``: one line per node, its name then its InternalIPs.
+    """
+    return (
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        "  --version) echo 'k3s version v1.33.0+k3s1 (abc)' ;;\n"
+        f"  kubectl) printf '%s\\n' {shlex.quote(nodes)} ;;\n"
+        "esac\n"
+    )
+
+
+def installed_server_with_api(
+    node: SystemdHost, nodes: str | None = None, script: str | None = None
+) -> AbstractContextManager[None]:
+    """Arrange an installed etcd-class server whose stand-in k3s answers the API.
+
+    ``script`` replaces the generated stub (the API-down case exits nonzero).
+    """
+    binary = script if script is not None else k3s_api_stub(nodes or "")
+    setup = (
+        f"mkdir -p {K3S}/server/db/etcd && {write('/usr/local/bin/k3s', binary)} "
+        "&& chmod 755 /usr/local/bin/k3s "
+        # A 0.4 server already runs the module default, so the flannel guard passes.
+        f"&& {write('/etc/rancher/k3s/config.yaml', 'flannel-backend: wireguard-native' + chr(10))}"
+    )
+    return arranged(node.host, setup, "rm -rf /var/lib/rancher /usr/local/bin/k3s /etc/rancher/k3s")
+
+
 def test_rejects_unsupported_os(systemd_host: SystemdHost) -> None:
     """Verify preflight rejects a host release no supported entry uses, before any change.
 
@@ -550,6 +582,110 @@ def test_refuses_a_sqlite_datastore(systemd_host: SystemdHost) -> None:
     assert kept
 
 
+@pytest.mark.parametrize(
+    ("files", "caller", "refused"),
+    [
+        ((), {}, True),
+        ((("config.yaml", "write-kubeconfig-mode: '0640'\n"),), {}, True),
+        (
+            (("config.yaml", "write-kubeconfig-mode: '0640'\n"),),
+            {"flannel-backend": "vxlan"},
+            False,
+        ),
+        (
+            (("config.yaml", "write-kubeconfig-mode: '0640'\n"),),
+            {"flannel-backend": "wireguard-native"},
+            False,
+        ),
+        ((("config.yaml", "flannel-backend: wireguard-native\n"),), {}, False),
+        (
+            (
+                ("config.yaml", "flannel-backend: vxlan\n"),
+                ("config.yaml.d/10-switch.yaml", "flannel-backend: wireguard-native\n"),
+            ),
+            {},
+            False,
+        ),
+    ],
+    ids=[
+        "no-config-file",
+        "no-key",
+        "keep-vxlan",
+        "switch-deliberately",
+        "already-wireguard-native",
+        "fragment-wins",
+    ],
+)
+def test_installed_server_flannel_backend_is_never_switched_silently(
+    systemd_host: SystemdHost,
+    files: tuple[tuple[str, str], ...],
+    caller: dict[str, Any],
+    refused: bool,
+) -> None:
+    """Verify an installed server without an explicit flannel-backend is refused, not switched.
+
+    Validates: the module default for servers is wireguard-native, and converging an
+        installed server that runs another backend (an absent key is flannel's vxlan
+        default) must stay an explicit caller decision: a silent switch partitions a
+        multi-node cluster, because nodes on different backends cannot talk and the old
+        flannel.1 routes persist until a reboot.
+    Code: ansible/roles/preflight/tasks/main.yml ("Refuse a silent flannel backend switch
+        on an installed server")
+
+    Assertion: with no flannel-backend in k3s_config and the node not on
+        wireguard-native, preflight refuses naming the current backend, the module
+        default and the fix, changing nothing; a caller that sets the key (either
+        backend) is accepted, and so is a node already on wireguard-native. A
+        config.yaml.d fragment sorted after config.yaml decides the backend in force
+        (k3s merges with the last value winning).
+
+    Method:
+    1. Arrange: an installed etcd server whose k3s config files are ``files``.
+    2. Act: run preflight with ``caller`` as k3s_config.
+    3. Assert: the refusal or the acceptance, with the node unchanged.
+    """
+    setup = f"mkdir -p {K3S}/server/db/etcd"
+    for name, body in files:
+        setup += f" && {write(f'/etc/rancher/k3s/{name}', body)}"
+    with arranged(systemd_host.host, setup, "rm -rf /var/lib/rancher /etc/rancher/k3s"):
+        result = preflight(systemd_host, k3s_config=caller)
+
+    if refused:
+        assert_refused(result, "runs flannel backend 'vxlan'")
+        assert 'flannel-backend = "wireguard-native"' in result.stdout + result.stderr
+    else:
+        assert_accepted(result)
+
+
+def test_agent_is_never_refused_over_the_flannel_backend(
+    systemd_host: SystemdHost, head_host: SystemdHost
+) -> None:
+    """Verify the flannel backend guard never fires for an agent: no flannel options.
+
+    Validates: flannel options are server-only and agents follow their servers, so an
+        agent's configuration must not be judged by the server backend guard.
+    Code: ansible/roles/preflight/tasks/main.yml ("Refuse a silent flannel backend switch
+        on an installed server")
+
+    Assertion: an installed agent whose config.yaml sets flannel-backend: vxlan, with no
+        k3s_config key, passes preflight unchanged (a server in the same arrangement is
+        refused by the test above).
+    """
+    config = "/etc/rancher/k3s/config.yaml"
+    with (
+        head_state(head_host, CA_A, True),
+        arranged(
+            systemd_host.host,
+            f"mkdir -p {K3S}/agent && {write(f'{K3S}/agent/server-ca.crt', CA_A)}"
+            f" && {write(config, 'flannel-backend: vxlan\n')}",
+            "rm -rf /var/lib/rancher /etc/rancher/k3s",
+        ),
+    ):
+        result = preflight(systemd_host, head=head_host, node_type="agent")
+
+    assert_accepted(result)
+
+
 def test_refuses_a_node_type_change_recorded_in_the_marker(systemd_host: SystemdHost) -> None:
     """Verify the marker's recorded node type must equal the requested one.
 
@@ -587,7 +723,9 @@ def test_rejects_downgrade_and_unreadable_version(
     Validates: FR-003 (downgrade is refused, never decided blind).
     Code: ansible/roles/preflight/tasks/main.yml ("Reject a k3s downgrade")
 
-    Method: an etcd layout (a known class) with a stand-in ``k3s`` that prints ``installed``.
+    Method: an etcd layout (a known class) with a stand-in ``k3s`` that prints
+        ``installed``; k3s_config pins the flannel backend so the installed-server
+        guard stays out of the way and only the version check can refuse.
     """
     script = f"#!/bin/sh\necho 'k3s version {installed} (abc)'\n"
     with arranged(
@@ -596,9 +734,138 @@ def test_rejects_downgrade_and_unreadable_version(
         "&& chmod 755 /usr/local/bin/k3s",
         "rm -rf /var/lib/rancher /usr/local/bin/k3s",
     ):
-        result = preflight(systemd_host)
+        result = preflight(systemd_host, k3s_config={"flannel-backend": "vxlan"})
 
     assert_refused(result, message)
+
+
+def test_refuses_cluster_peers_outside_node_trusted_cidrs(systemd_host: SystemdHost) -> None:
+    """Verify an installed server refuses a managed firewall that would drop its peers.
+
+    Validates: converge-time peer coverage (R3). The plan exempts ``initial`` from a
+        non-empty ``node_trusted_cidrs`` because a standalone node has no peers, so a
+        v0.3 cluster whose head lists joiners only in ``api_trusted_cidrs`` would pass
+        the plan and silently drop them on 10250 (and 8472) after the upgrade.
+    Code: ansible/roles/preflight/tasks/main.yml ("Check the cluster peers of an
+        installed server against node_trusted_cidrs")
+
+    Assertion: the refusal names every uncovered peer node and address (v4 and v6)
+        and the remediation, changing nothing.
+
+    Method:
+    1. Arrange: an installed etcd-class server whose stand-in ``k3s`` answers
+       ``--version`` and reports itself plus two peers (v4 and v6) as node lines.
+    2. Act: preflight with a ``node_trusted_cidrs`` covering neither peer.
+    3. Assert: refused by the coverage assert, both peers named.
+    """
+    self_name = systemd_host.host.run("hostname").stdout.strip().lower()
+    peers = f"{self_name} 192.0.2.10\npeer-a 192.0.2.11\npeer-b 2001:db8::12\n"
+    with installed_server_with_api(systemd_host, peers):
+        result = preflight(systemd_host, node_trusted_cidrs=["198.51.100.0/24"])
+
+    output = result.stdout + result.stderr
+    assert_refused(result, "does not cover the cluster peers peer-a 192.0.2.11")
+    assert "peer-b 2001:db8::12" in output, output
+    assert "node_trusted_cidrs" in output
+
+
+def test_accepts_installed_server_with_covered_cluster_peers(systemd_host: SystemdHost) -> None:
+    """Verify an installed server passes when node_trusted_cidrs covers every peer.
+
+    Validates: the coverage guard's positive path; self and peers, v4 and v6, /24
+        and /64 containment.
+    Code: ansible/roles/preflight/tasks/main.yml ("Check the cluster peers of an
+        installed server against node_trusted_cidrs")
+    """
+    self_name = systemd_host.host.run("hostname").stdout.strip().lower()
+    peers = f"{self_name} 192.0.2.10\npeer-a 192.0.2.11\npeer-b 2001:db8::12\n"
+    with installed_server_with_api(systemd_host, peers):
+        result = preflight(systemd_host, node_trusted_cidrs=["192.0.2.0/24", "2001:db8::/64"])
+
+    assert_accepted(result)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "staging"),
+    [
+        ({}, "pristine"),
+        ({"firewall_mode": "off"}, "installed"),
+    ],
+    ids=["fresh-install", "firewall-off"],
+)
+def test_peer_coverage_never_fires_off_managed_installed_servers(
+    systemd_host: SystemdHost, overrides: dict[str, Any], staging: str
+) -> None:
+    """Verify the peer-coverage guard only runs on a managed installed server.
+
+    Validates: a fresh install (class ``none``, no peers yet) and off mode (no
+        table) never run the check, even with an empty ``node_trusted_cidrs``
+        and uncovered peers reported by the API.
+    Code: ansible/roles/preflight/tasks/main.yml (the block's ``when``)
+
+    Assertion: both cases pass preflight; the installed case proves the skip
+        (the same staging refuses under managed mode in
+        ``test_refuses_cluster_peers_outside_node_trusted_cidrs``).
+    """
+    peers = "peer-a 192.0.2.11\n"
+    if staging == "installed":
+        with installed_server_with_api(systemd_host, peers):
+            result = preflight(systemd_host, node_trusted_cidrs=[], **overrides)
+    else:
+        result = preflight(systemd_host, node_trusted_cidrs=[], **overrides)
+
+    assert_accepted(result)
+
+
+def test_peer_coverage_skips_agents(systemd_host: SystemdHost, head_host: SystemdHost) -> None:
+    """Verify agents never run the peer-coverage guard: they hold no admin kubeconfig.
+
+    Code: ansible/roles/preflight/tasks/main.yml (the block's ``when``)
+
+    Assertion: an installed agent whose API would report an uncovered peer, with
+        empty ``node_trusted_cidrs``, passes preflight.
+    """
+    setup = (
+        f"mkdir -p {K3S}/agent && {write(f'{K3S}/agent/server-ca.crt', CA_A)} "
+        f"&& {write('/usr/local/bin/k3s', k3s_api_stub('peer-a 192.0.2.11\n'))} "
+        "&& chmod 755 /usr/local/bin/k3s"
+    )
+    with (
+        head_state(head_host, CA_A, True),
+        arranged(systemd_host.host, setup, "rm -rf /var/lib/rancher /usr/local/bin/k3s"),
+    ):
+        result = preflight(systemd_host, head=head_host, node_type="agent", node_trusted_cidrs=[])
+
+    assert_accepted(result)
+
+
+def test_peer_coverage_warns_when_the_api_does_not_answer(
+    systemd_host: SystemdHost,
+) -> None:
+    """Verify an installed server whose API is down warns instead of failing.
+
+    Validates: the recovery trade-off. Converge is the way a stopped k3s is
+        restarted (the k3s role starts the unit), so refusing here would brick
+        that path; the guard runs on the next converge instead.
+    Code: ansible/roles/preflight/tasks/main.yml ("Note when the node API did
+        not answer")
+
+    Assertion: preflight passes and the output carries the warning telling the
+        operator to check the peer coverage by hand.
+    """
+    script = (
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        "  --version) echo 'k3s version v1.33.0+k3s1 (abc)' ;;\n"
+        "  kubectl) echo 'The connection to the server was refused' >&2; exit 1 ;;\n"
+        "esac\n"
+    )
+    with installed_server_with_api(systemd_host, script=script):
+        result = preflight(systemd_host, node_trusted_cidrs=[])
+
+    output = result.stdout + result.stderr
+    assert_accepted(result)
+    assert "cannot verify that node_trusted_cidrs covers the cluster peers" in output, output
 
 
 def test_head_must_be_reachable(systemd_host: SystemdHost) -> None:
@@ -692,7 +959,13 @@ def test_installed_node_ca_is_compared_with_the_head(
         head_state(head_host, CA_A, True),
         arranged(systemd_host.host, setup, "rm -rf /var/lib/rancher"),
     ):
-        result = preflight(systemd_host, head=head_host, node_type=node_type)
+        # The flannel key keeps the installed-server backend guard out of the way.
+        result = preflight(
+            systemd_host,
+            head=head_host,
+            node_type=node_type,
+            k3s_config={"flannel-backend": "vxlan"},
+        )
 
     if refusal is None:
         assert_accepted(result)

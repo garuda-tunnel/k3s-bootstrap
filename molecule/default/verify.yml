@@ -57,11 +57,12 @@
         k3sb_config: "{{ k3sb_config_raw.content | b64decode | from_yaml }}"
       no_log: true
 
-    - name: Assert the config has no token key and initializes etcd
+    - name: Assert the config has no token key, initializes etcd and defaults the flannel backend
       ansible.builtin.assert:
         that:
           - k3sb_config.keys() | select('search', 'token') | list | length == 0
           - k3sb_config['cluster-init'] is true
+          - k3sb_config['flannel-backend'] == 'wireguard-native'
       no_log: true
 
     - name: Assert the kubeconfig carries the login user's real primary group
@@ -200,7 +201,8 @@
                'tls-san': k3sb_manual_config_values['tls-san'],
                'write-kubeconfig-mode': k3sb_manual_config_values['write-kubeconfig-mode'],
                'write-kubeconfig-group': k3sb_manual_config_values['write-kubeconfig-group'],
-               'cluster-init': k3sb_manual_config_values['cluster-init']
+               'cluster-init': k3sb_manual_config_values['cluster-init'],
+               'flannel-backend': k3sb_manual_config_values['flannel-backend']
              }) | to_nice_yaml(indent=2) }}
       no_log: true
 
@@ -415,6 +417,41 @@
 
     - name: Check the readiness negatives
       ansible.builtin.include_tasks: tasks/readiness.yml
+
+    - name: Apply the caller's flannel-backend override
+      # The caller's k3s_config must win over the module default.
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+      vars:
+        k3sb_apply_vars: {k3s_config: {flannel-backend: vxlan}}
+
+    - name: Read the config rendered with the override
+      become: true
+      delegate_to: "{{ k3sb_instance }}"
+      ansible.builtin.slurp:
+        src: /etc/rancher/k3s/config.yaml
+      register: k3sb_flannel_override_raw
+
+    - name: Assert the caller's flannel-backend wins over the module default
+      ansible.builtin.assert:
+        that: (k3sb_flannel_override_raw.content | b64decode | from_yaml)['flannel-backend'] == 'vxlan'
+
+    - name: Apply without flannel-backend over the installed vxlan server
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+      vars:
+        k3sb_apply_vars: {}
+        k3sb_apply_may_fail: true
+
+    - name: Assert preflight refuses the silent switch back to the module default
+      ansible.builtin.assert:
+        that:
+          - k3sb_run.rc != 0
+          - k3sb_run.stdout is search("runs flannel backend 'vxlan'")
+
+    - name: Switch back to the module default deliberately
+      # Later plays expect the module default, as a fresh install has it.
+      ansible.builtin.include_tasks: ../shared/tasks/apply.yml
+      vars:
+        k3sb_apply_vars: {k3s_config: {flannel-backend: wireguard-native}}
 
 - name: Verify the embedded runc AppArmor attachment
   hosts: localhost

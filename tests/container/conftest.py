@@ -91,6 +91,7 @@ def node_vars(node: SystemdHost) -> dict[str, Any]:
         "extra_packages": [],
         "k3s_version": "v1.33.0+k3s1",
         "api_trusted_cidrs": [],
+        "node_trusted_cidrs": [],
         "cluster_cidrs": [],
         "grow_root_filesystem": False,
         "apparmor_container_profile_fix": True,
@@ -293,6 +294,7 @@ def fixture_controller_key(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "-a",
         "br_netfilter",
         "overlay",
+        "wireguard",
     )
     key_path = tmp_path_factory.mktemp("ssh") / "id_ed25519"
     subprocess.run(

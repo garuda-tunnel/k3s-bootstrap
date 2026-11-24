@@ -28,13 +28,26 @@ provisioner:
     host_vars:
       k3sb-molecule-cluster-init:
         # A head user other than the joining nodes' ssh_user: delegated head
-        # tasks must connect as head.user.
-        k3s_node: {node_type: initial, ssh_user: ops, firewall_mode: 'off', readiness_timeout: 10m}
+        # tasks must connect as head.user. Every node runs the managed
+        # firewall; peers and the controller live on the shared management
+        # network 192.168.122.0/24, and node trust also carries the joiners'
+        # API traffic.
+        k3s_node:
+          node_type: initial
+          ssh_user: ops
+          node_trusted_cidrs: [192.168.122.0/24]
+          readiness_timeout: 10m
       k3sb-molecule-server:
-        k3s_node: {node_type: server, firewall_mode: 'off', readiness_timeout: 10m}
+        k3s_node:
+          node_type: server
+          node_trusted_cidrs: [192.168.122.0/24]
+          readiness_timeout: 10m
         k3s_head: k3sb-molecule-cluster-init
       k3sb-molecule-agent:
-        k3s_node: {node_type: agent, firewall_mode: 'off', readiness_timeout: 10m}
+        k3s_node:
+          node_type: agent
+          node_trusted_cidrs: [192.168.122.0/24]
+          readiness_timeout: 10m
         k3s_head: k3sb-molecule-cluster-init
   playbooks:
     prepare: ../shared/prepare.yml

@@ -30,7 +30,13 @@ registered hostvars, host-key settings), launch parity between `main.tf`
 and both harnesses, the Molecule launch judge, `run_hash`, and preservation
 of the distro ABI/body when extending the runc attachment, validation before
 migration, kernel/file reconciliation decisions and operator disable-marker
-ownership. Runs in CI:
+ownership. `test_firewall_policy.py` renders the production template with Ansible
+and checks packet verdicts with nftables in a disposable user/network namespace;
+it skips if `unshare`, `ip`, `nft`, or namespace access is unavailable locally.
+Set `K3SB_FIREWALL_REQUIRED=1` to fail instead of skip. CI runs this required
+gate as root inside a disposable network namespace, accommodating hosted runners
+that block unprivileged user namespaces. The helper creates its own fresh network
+namespace before changing networking. Runs in CI:
 `.venv/bin/pytest tests/controller`.
 
 ## Container tier (`container/`)
@@ -54,7 +60,9 @@ The fixture masks `apparmor.service` to prevent boot-time policy loading
 into that shared kernel; only native userspace parsing is tested here.
 
 Needs privileged Docker, OpenTofu, and `/lib/modules` matching the Docker
-host's running kernel with `br_netfilter` and `overlay` available. The
+host's running kernel with `br_netfilter`, `overlay` and `wireguard`
+available (preflight requires all three on every node, regardless of the
+flannel backend). The
 fixture loads those modules with a disposable privileged helper, then sets
 the bridge sysctls in the test container's own network namespace and mounts
 `/lib/modules` read-only so the role's real modprobe checks can run. Module

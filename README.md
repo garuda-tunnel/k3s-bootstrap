@@ -19,8 +19,9 @@ The playbook connects to the node over SSH and does every host change:
 preflight checks, the admin user (`ssh_user`, passwordless sudo, keys),
 SSH hardening (key-only, root login off, applied only after a fresh login as
 `ssh_user` succeeded), kernel modules and sysctls, the managed firewall,
-k3s, and a bounded readiness check. Nothing is copied to or installed on
-the node for the run. On a **first install** only, if the host asks for a
+k3s, and a bounded readiness check. Ansible runs on the controller and executes modules over SSH; those tasks
+install packages and write configuration on the node. The node does not need
+an Ansible installation. On a **first install** only, if the host asks for a
 reboot (`/run/reboot-required`), it reboots with `ansible.builtin.reboot`
 before k3s is installed; an installed or adopted node is never rebooted.
 Ubuntu writes that file when an update needs a restart; stock Debian does
@@ -59,7 +60,8 @@ module "hub" {
   authorized_keys      = ["ssh-ed25519 AAAA... admin@example"]
   k3s_version          = "v1.36.5+k3s1"
   cluster_cidrs        = ["10.42.0.0/16", "10.43.0.0/16"]
-  api_trusted_cidrs    = ["192.0.2.0/24"] # the controller and every joining node
+  api_trusted_cidrs    = ["203.0.113.10/32"] # controller and operators only, not peers
+  node_trusted_cidrs   = ["192.0.2.11/32", "192.0.2.12/32"] # peers once; derive from node-ip: [for n in local.k3s_nodes : "${n.node_ip}/32"]
 }
 
 module "server_2" {
@@ -94,17 +96,66 @@ module "agent" {
   `ansible/requirements.txt` in an isolated environment and fails before
   touching a host if the toolchain differs.
 - **Host keys**: with `host_key_check = true` (default) the node's and the
-  head's keys must already be in your `known_hosts` (`ssh-keyscan` once,
-  then persist it; never rescan on every apply). An unknown or changed key
+  head's keys must already be in your `known_hosts` (collect once, verify the fingerprints through a trusted channel,
+  then persist them; never rescan on every apply). An unknown or changed key
   fails the run. `false` trusts any key.
 - **One key**: `ssh_private_key_file` reaches the node and its head; the
   module passes the path, never the key material.
 - **Server order**: servers join one at a time; order them with
   `depends_on`. Agents may apply in parallel.
-- **Firewall**: in `managed` mode the node gates the k3s API (6443) and
-  etcd (2379-2380) to loopback, `api_trusted_cidrs` and `cluster_cidrs`.
-  List the controller and every node that joins through this head (or the
-  other servers' addresses, for etcd) in its `api_trusted_cidrs`.
+- **Firewall**: on every managed node — `initial`, `server` and `agent`
+  alike — the following inbound sources are allowed; other sources are
+  dropped on those ports only, for IPv4 and IPv6:
+
+  | Ports | Allowed sources (plus loopback) |
+  | --- | --- |
+  | TCP 6443, 2379-2380 | `api_trusted_cidrs`, `cluster_cidrs`, `node_trusted_cidrs` |
+  | TCP 10250 (kubelet) | `cluster_cidrs`, `node_trusted_cidrs` |
+  | UDP 8472 (Flannel VXLAN) | `node_trusted_cidrs` |
+
+  `api_trusted_cidrs` lists only sources that are not cluster nodes: the
+  controller and operators. Peer nodes are listed once, in
+  `node_trusted_cidrs`, which also grants the API and etcd ports, because a
+  peer cannot function without the API (and with the embedded registry
+  mirror every node serves 6443 to its peers). `cluster_cidrs` is required
+  on every managed node. Derive `node_trusted_cidrs` from your node list
+  instead of hand-maintaining it, from the addresses peers actually send
+  from: each node's `node-ip` (or its flannel interface address), which is
+  not necessarily the SSH `host` (NAT or a separate management interface
+  in between); for example `[for n in local.k3s_nodes : "${n.node_ip}/32"]`
+  (`/128` for IPv6). Listing the node itself is harmless. The initial
+  server needs
+  `node_trusted_cidrs` too once other nodes join; the plan does not catch
+  an empty list there (initial is exempt because a standalone initial
+  node has no peers), so populate it yourself when the first joiner
+  arrives. On an installed server (`initial` or `server`, k3s present)
+  preflight closes that gap at converge time: it reads every other
+  node's InternalIP addresses from the node's own API and refuses the
+  apply while any peer is outside `node_trusted_cidrs` (when the API is
+  down the run continues with a warning; see Refusals). With
+  metrics-server, pods scraping a remote kubelet arrive
+  with the source node IP — flannel masquerades pod traffic to node
+  addresses by default on IPv4; IPv6 masquerade needs
+  `flannel-ipv6-masq`, and without it IPv6 pod traffic keeps the pod
+  source, which `cluster_cidrs` already trusts — which is why 10250
+  trusts node sources. SSH and unrelated
+  ports are unchanged; `off` mode does not manage this firewall. Other
+  host or network filters still apply.
+- **Flannel backend**: the module sets `flannel-backend: wireguard-native`
+  on servers unless your `k3s_config` sets `flannel-backend` (your value
+  always wins; flannel options are server-only and agents follow the
+  servers). WireGuard encrypts the overlay and authenticates peers by key,
+  silently dropping everything else, so the firewall opens no UDP 51820 or
+  51821 rule and cannot help there. UDP 51820 and 51821 are reserved for
+  flannel: no hostPort or host service may use them. Callers that keep
+  VXLAN set `k3s_config = { flannel-backend = "vxlan" }` and must keep
+  `node_trusted_cidrs` covering the peers: VXLAN has no authentication and
+  UDP sources can be spoofed, so on a public underlay prefer
+  `wireguard-native`. The module loads the `wireguard` kernel module on
+  every node. The embedded registry mirror (Spegel), when enabled, makes
+  every node serve TCP 6443 and peers exchange on TCP 5001; 6443 is already
+  covered by `node_trusted_cidrs` on every node, 5001 is not gated by this
+  table.
 - **Back up the cluster token**: `/var/lib/rancher/k3s/server/token` on a
   server is the cluster's identity for every future server join and for
   datastore restores.
@@ -115,8 +166,9 @@ module "agent" {
   `config.yaml`: the last value wins, `key+` appends) and in unit drop-ins
   (`systemctl edit k3s`); the module never writes there, and a converge
   restarts k3s when a fragment changed after it started. Do not override
-  the module-owned keys there (`server`, `token-file`, `cluster-init`, the
-  kubeconfig mode and group); `data-dir` and `datastore-endpoint` are
+  the module-owned keys there (`server`, `token-file`, `cluster-init`,
+  the kubeconfig mode and group, `flannel-backend`); set the latter in
+  `k3s_config` instead. `data-dir` and `datastore-endpoint` are
   refused.
 - **No secrets in `k3s_config`**: it is passed on the controller command
   line and hashed into the re-run trigger. Join tokens are never input.
@@ -129,6 +181,45 @@ module "agent" {
   the marker changes no input, so a plain apply does nothing): the run mints
   a new token and rejoins it.
 
+## Upgrading from v0.3.x (breaking)
+
+1. **Agents are now firewalled** in `managed` mode (the default): they get
+   the same nftables table as servers, because they serve kubelet and
+   flannel and an open agent would re-open the unauthenticated VXLAN
+   overlay for the whole cluster. Agents that must stay unmanaged now set
+   `firewall_mode = "off"` explicitly; removing an existing module
+   firewall is still the operator's step (see Refusals).
+2. **In `managed` mode, `server` and `agent` nodes require non-empty
+   `node_trusted_cidrs`, and agents now require `cluster_cidrs`**, both
+   checked at plan time (`off` mode is exempt).
+   The plan does not catch an empty list on the `initial` node (initial
+   is exempt because a standalone initial node has no peers), so
+   populate `node_trusted_cidrs` on the initial server yourself once
+   joiners exist, together with the joiners' own lists. The converge-time
+   guard refuses the apply while any peer the node's API reports is
+   outside `node_trusted_cidrs`, so a v0.3 cluster whose head is not
+   covered fails its first converge with the uncovered peers named,
+   instead of silently dropping them; fix the list and apply again.
+3. **The default flannel backend is `wireguard-native`.** Existing
+   multi-node VXLAN clusters must set `flannel-backend: vxlan` in
+   `k3s_config` **before** upgrading; otherwise pod networking partitions
+   during the rollout: k3s/flannel leave the old `flannel.1` link in
+   place when the backend changes, and nodes running different backends
+   cannot talk to each other. To switch a running cluster deliberately,
+   change the config on all servers, then reboot every node (servers
+   first), and rehearse it on a scratch cluster first (see
+   <https://github.com/k3s-io/k3s/discussions/8868>). A k3s service
+   restart alone is not enough: the old per-peer routes via `flannel.1`
+   are more specific than the WireGuard backend's cluster route and keep
+   winning until the node reboots. Any other firewall on the path must
+   pass peer UDP 51820/51821. Standalone single-node clusters switch on
+   their next restart, with the stale `flannel.1` link left behind until
+   a reboot. Preflight refuses the silent path: an installed server whose
+   `k3s_config` sets no `flannel-backend` and that does not already run
+   `wireguard-native` fails the run; set `flannel-backend: vxlan` to keep
+   the cluster as it is, or `flannel-backend: wireguard-native` to perform
+   the switch above deliberately.
+
 ## Refusals
 
 Preflight refuses, before changing anything: a host other than Ubuntu
@@ -137,10 +228,15 @@ is etcd only
 and never converts; migration is out of scope); a k3s layout it cannot see
 (custom `data-dir` or `datastore-endpoint` in units, environment or k3s
 config files, or a running k3s without recognisable data); a change of
-node type, server/agent role or datastore; a k3s downgrade; a node whose
+node type, server/agent role or datastore; a k3s downgrade; an installed
+server that would silently switch flannel backend (`k3s_config` without
+`flannel-backend` and the node not already on `wireguard-native`; set the
+key, see [Upgrading](#upgrading-from-v03x-breaking)); a node whose
 cluster CA differs from its head's; an unreachable head or one that is not
 an initialised server; enabled ufw or firewalld with `firewall_mode =
-"managed"`; and `firewall_mode = "off"` over an existing module firewall
+"managed"`; an installed server (`initial` or `server`) whose cluster
+peers, read from its own node API, are not covered by `node_trusted_cidrs`
+(a warning instead when the API does not answer); and `firewall_mode = "off"` over an existing module firewall
 (remove it by hand: `systemctl disable --now k3s-bootstrap-firewall`,
 `nft destroy table inet k3s_bootstrap`, delete the unit and
 `/etc/k3s-bootstrap/firewall.nft`, `systemctl daemon-reload`).
@@ -152,49 +248,20 @@ distro runc profile declaration. Restore the distro policy and rerun.
 
 ## AppArmor embedded runc attachment
 
-On Ubuntu kernels 7.0.0-41 and later with unconfined restrictions
-([LP #2172422](https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2172422)),
-k3s's embedded runc does not match the distro's `/usr/{bin,sbin}/runc`
-attachment. Running as plain `unconfined`, it produces the stacked label
-`cri-containerd.apparmor.d//&unconfined`: intra-pod signals fail, and
-executables inside runtime-profiled containers can attach to unrelated **host** profiles
-(`wg-quick`, routing daemons, `locale`, or any other matching path).
-The v0.3.1 containerd signal/ptrace patch fixed only the first symptom.
+`apparmor_container_profile_fix = true` extends the distro `runc` profile to
+k3s's embedded runtime. This prevents a plain `unconfined` stack member from
+breaking signals and attaching runtime-profiled containers to unrelated host
+profiles on restricted kernels. Recreate affected pods after rollout.
 
-`apparmor_container_profile_fix = true` (default; released input name
-unchanged) installs `/etc/apparmor.d/k3s-bootstrap-runc`, defining **`runc`**
-with the distro's native policy and an attachment covering both distro
-paths and `/var/lib/rancher/k3s/data/*/bin/runc`. A standard disable symlink
-prevents the untouched distro file from replacing ours on boot, reload
-or package upgrade. The render is parser-validated before writing, loaded
-before k3s starts, and reconciled using a completed-load checksum stamp.
-The role requires the standard AppArmor service to be enabled; it loads
-the policy on later boots. Missing loaded runc policy also forces reconciliation.
-No extra loader or
-k3s minor-line mapping is needed. Ubuntu 26.04 and Debian 13 both ship the
-base runc profile. Missing stock policy without unconfined restrictions
-skips the fix; a restricted kernel fails rather than silently proceeding.
+Unprofiled workloads can inherit the named, unconfined `runc` profile,
+including its `userns` permission and host-profile exec attachment behavior.
+This does not add container confinement. Setting the input to `false`
+restores module-managed files to the stock policy without unloading live
+profiles; existing processes are not relabelled.
 
-**Security trade-off:** pause, privileged and `appArmorProfile: Unconfined`
-workloads that do not change profile can now inherit the named
-`flags=(unconfined)` **`runc` profile, including its `userns` allow**, instead
-of plain `unconfined`. This is exactly the treatment Ubuntu already gives
-its packaged `/usr/bin/runc`, extended to k3s's embedded binary. No host
-restriction sysctl is changed; this is not additional container confinement.
-These **runc-labelled workloads retain unconfined-style exec attachment into
-host profiles**. Preventing those transitions applies only to containers
-that change to a runtime profile, such as RuntimeDefault.
-
-Recreate affected pods after rollout: existing stacked labels remain.
-On module-managed nodes, setting the input to `false` removes our file and the disable symlink,
-then reloads the distro `runc` policy without unloading any profile.
-An operator-made disable symlink alone, without our profile or stamp, is untouched.
-With AppArmor off, only file cleanup is possible; stock loads on the next
-AppArmor-enabled boot. Migration removes all v0.3.1 files, stamp and loader
-unit but **leaves its already-loaded containerd policy alone**: containerd
-reuses it until reboot, when its built-in default returns. Never unload a
-profile under live containers. Implementation, distro/reload evidence,
-rollback details and limitations: [k3s role README](ansible/roles/k3s/README.md#runc-apparmor-attachment).
+The [k3s role documentation](ansible/roles/k3s/README.md#runc-apparmor-attachment)
+contains the activation prerequisites, dependency guarantees and rollback
+procedure. Read it before changing this setting.
 
 ## Inputs and outputs
 
@@ -238,4 +305,8 @@ The molecule and VM tiers are manual, never in CI, and run through
 
 - OpenTofu >= 1.9.0.
 - Controller: `uv`, `ssh`.
-- Target host: Ubuntu 26.04 LTS or Debian 13, with systemd and Python 3.
+- Target host: Ubuntu 26.04 LTS or Debian 13, with systemd and Python 3,
+  and the `wireguard` kernel module available: preflight checks it on
+  every node regardless of the flannel backend, because the module's
+  default backend needs it on servers and agents alike.
+

@@ -1,6 +1,6 @@
 [Unit]
 Description=Isolated k3s bootstrap firewall
-Before=k3s.service
+Before=k3s.service k3s-agent.service
 
 [Service]
 Type=oneshot
